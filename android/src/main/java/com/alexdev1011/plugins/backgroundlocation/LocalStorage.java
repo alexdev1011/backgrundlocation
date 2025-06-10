@@ -29,7 +29,6 @@ public class LocalStorage {
                 text.append('\n');
             }
             br.close();
-            System.out.print(text.toString());
             return text.toString();
         }
         catch (IOException e) {
@@ -47,7 +46,7 @@ public class LocalStorage {
             fis.close();
             return o;
         } catch (FileNotFoundException e) {
-            e.printStackTrace();
+            //e.printStackTrace();
             return null;
         } catch (IOException e) {
             e.printStackTrace();
@@ -59,14 +58,12 @@ public class LocalStorage {
     }
 
     public boolean setObject (String key , Object object  ) throws IOException {
-        System.out.println(object);
         FileOutputStream fos = context.openFileOutput(key, Context.MODE_PRIVATE);
         ObjectOutputStream os = new ObjectOutputStream(fos);
         if(os != null)
             os.writeObject(object);
         os.close();
         fos.close();
-        System.out.println("funciono");
         return true;
     }
 

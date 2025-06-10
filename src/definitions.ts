@@ -1,10 +1,10 @@
 
 
 export interface WatcherOptions {
-  notificationTitle: String;
-  notificationContent: String;
+  notificationTitle: string;
+  notificationContent: string;
   minS: number;
-  urlRequests: String | null;
+  urlRequests: string | null;
   inBG: boolean;
   distanceFilter: number;
   userId : string;
@@ -25,6 +25,9 @@ export interface Location {
 }
 
 export interface BackgroundLocationPlugin {
+
+  setMotivo( motivo : { code : number, message : string } ) : void;
+
   echo(options: { value: string }): Promise<{ value: string }>;
 
   panic() : void;
@@ -40,6 +43,7 @@ export interface BackgroundLocationPlugin {
   startService(options: WatcherOptions,
     callback: (
       position?: Location,
+      // eslint-disable-next-line @typescript-eslint/ban-types
       error?: Object
     ) => void
   ): Promise<string>;

@@ -19,20 +19,15 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
-import android.os.Looper;
-import android.os.PowerManager;
 import android.util.Log;
-import android.widget.Toast;
 
 import androidx.annotation.RequiresApi;
 import androidx.core.app.ActivityCompat;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Logger;
 import com.google.android.gms.location.LocationCallback;
-import com.google.android.gms.location.LocationRequest;
 import com.google.android.gms.location.LocationResult;
-import com.google.android.gms.location.LocationServices;
-import com.google.android.gms.tasks.Task;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -43,6 +38,12 @@ import java.util.Date;
 import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class BackgroundLocationService extends Service {
     private Notification noty;
@@ -50,51 +51,56 @@ public class BackgroundLocationService extends Service {
     private LocalStorage localStorage = new LocalStorage(this);
     public ServiceSettings settings = new ServiceSettings();
     private JSObject motivo = new JSObject();
-
     private static final int NOTIFICATION_ID = 45023;
-    private Toast toast;
-    public static final String BROADCAST_ACTION = "Hello World";
-    private static final int TWO_MINUTES = 1000 * 60 * 2;
     public LocationManager locationManager;
     public MyLocationListener listenerNetwork;
     public MyLocationListener listenerGPS;
     public MyLocationListener listenerLocation;
-    public JSONArray unSaveLocations;
     public TramaStorage tramaStorage;
-    private Http httpRequests = new Http();
     private Context context;
     public Location lastLocationSending = null;
-    private JSONArray tramasAllLocal = new JSONArray();
-    private List<Location> bufferTramas = new ArrayList<>();
-    Intent intent;
-    int counter = 0;
+    private static final int MAX_BUFFER_SIZE = 1000; // Ajustar según necesidades
+    private List<Location> bufferTramas = new ArrayList<Location>();
     int startId = 0;
-
     private int accuracy = 15;
     long serviceStarterAt = 0;
     long lastSendingAt = 0;
-    private PowerManager.WakeLock wl;
+    private Timer timer;
+    private TimerTask timerTask;
+    private Boolean RESTARTSERVICE = false;
+    private BitacoraManager bitacoraManager = new BitacoraManager(this);
 
-
-    protected Location isBetterLocationinArray( Boolean force ){
+    protected Location isBetterLocationinArray(Boolean force) {
         Location tramaDeRetorno = null;
-        List<Location> stackbufferTramas = this.bufferTramas;
-        for(int i = 0; i < stackbufferTramas.size() ; i++ ){
-            if(tramaDeRetorno == null ){
-                   tramaDeRetorno = stackbufferTramas.get(i);
-            } else {
-                long timeDelta = stackbufferTramas.get(i).getTime() - tramaDeRetorno.getTime();
-                boolean isNewer = timeDelta > 0;
-                int accuracyDelta = (int) (stackbufferTramas.get(i).getAccuracy() - tramaDeRetorno.getAccuracy());
-                boolean isLessAccurate = accuracyDelta > 0;
-                boolean isMoreAccurate = accuracyDelta < 0;
-                boolean isSignificantlyLessAccurate = accuracyDelta > 1;
-                if(isMoreAccurate){
-                    tramaDeRetorno = stackbufferTramas.get(i);
-                }else if( isNewer && !isLessAccurate ){
-                    tramaDeRetorno = stackbufferTramas.get(i);
+        
+        try {
+            // Limitar tamaño del buffer
+            if (bufferTramas.size() > MAX_BUFFER_SIZE) {
+                bufferTramas = bufferTramas.subList(bufferTramas.size() - MAX_BUFFER_SIZE, bufferTramas.size());
+            }
+
+            for(int i = 0; i < bufferTramas.size(); i++) {
+                if(tramaDeRetorno == null) {
+                    tramaDeRetorno = bufferTramas.get(i);
+                } else {
+                    if(bufferTramas.get(i) != null && tramaDeRetorno != null) {
+                        long timeDelta = bufferTramas.get(i).getTime() - tramaDeRetorno.getTime();
+                        boolean isNewer = timeDelta > 0;
+                        int accuracyDelta = (int) (bufferTramas.get(i).getAccuracy() - tramaDeRetorno.getAccuracy());
+                        boolean isLessAccurate = accuracyDelta > 0;
+                        boolean isMoreAccurate = accuracyDelta < 0;
+                        boolean isSignificantlyLessAccurate = accuracyDelta > 1;
+                        if(isMoreAccurate){
+                            tramaDeRetorno = bufferTramas.get(i);
+                        }else if( isNewer && !isLessAccurate ){
+                            tramaDeRetorno = bufferTramas.get(i);
+                        }
+                    }
                 }
             }
+        } catch (Error error) {
+            bitacoraManager.guardarEvento("Error en buffer", 500, error.getMessage());
+            bufferTramas.clear(); // Limpiar en lugar de crear nueva lista
         }
         if(tramaDeRetorno == null) {
             motivo = new JSObject();
@@ -107,33 +113,64 @@ public class BackgroundLocationService extends Service {
         else return null;
     }
     protected Location isBetterLocation(Location location, Location lastLocationSending ) {
+
+        if(location == null ){
+            return null;
+        }
+
         long deltaTime = 0;
+
         if(this.bufferTramas.size() > 2 ){
             deltaTime = location.getTime() - this.bufferTramas.get(0).getTime();
             if( deltaTime > 4000  ){
                 this.bufferTramas.remove(0);
             }
         }
-        this.bufferTramas.add(location);
-
-        System.out.println(deltaTime + " "  + bufferTramas.size());
-
-        if(this.bufferTramas.size() < 3 || deltaTime < 4000 ){
+        try{
+            this.bufferTramas.add(location);
+        }catch (Error err){
+            this.bufferTramas = new ArrayList<Location>();
+            this.bufferTramas.add(location);
+            System.out.println(err);
             return null;
         }
 
-        long latitud = 0;
-        long longitud = 0;
+
+        /*
+        if((this.bufferTramas.size() < 3 || deltaTime < 4000 ) && lastLocationSending != null ){
+            return null;
+        }
+        */
+        try {
+            Object obg =  this.localStorage.getObject("motivo");
+            if(obg != null){
+                Motivo mot = (Motivo) obg;
+                if(!(mot).sending){
+                    motivo = new JSObject();
+                    motivo.put("code", mot.code);
+                    motivo.put("message", mot.message);
+                    Location resolver = this.isBetterLocationinArray(true);
+                    mot.sending = true;
+                    localStorage.setObject("motivo",mot);
+                    return resolver;
+                }
+            }
+        } catch (Error | IOException error ){
+            Log.e("error",error.getMessage());
+        }
+
+
         if(settings.stopService){
            // toast.makeText( context, "serivico detenido ultima trama " , Toast.LENGTH_SHORT ).show();
             motivo = new JSObject();
-            motivo.put("code", 25);
+            motivo.put("code", 1002);
             motivo.put("message", "serivico detenido ultima trama");
             Location resolver = this.isBetterLocationinArray(true);
             return resolver;
         }
+
         if(settings.panico){
-            toast.makeText( context, "panico activado " , Toast.LENGTH_SHORT ).show();
+            //toast.makeText( context, "panico activado " , Toast.LENGTH_SHORT ).show();
             motivo = new JSObject();
             motivo.put("code", 51);
             motivo.put("message", "Panico activado");
@@ -147,7 +184,7 @@ public class BackgroundLocationService extends Service {
             if(resolver != null ) {
                 //Toast.makeText( getApplicationContext(), "porque es la primera" ,Toast.LENGTH_LONG).show();
                 motivo = new JSObject();
-                motivo.put("code", 1);
+                motivo.put("code", 1001);
                 motivo.put("message", "primer toma de contacto al activar el seguimiento");
                 return resolver;
             }
@@ -183,7 +220,7 @@ public class BackgroundLocationService extends Service {
 
             if(resolver != null){
                 motivo = new JSObject();
-                motivo.put("code", 2);
+                motivo.put("code", 1000);
                 motivo.put("message", "por tiempo limite " + settings.minS +" segundos" );
                 //Toast.makeText( getApplicationContext(), "porque llego al tiempo limite " ,Toast.LENGTH_LONG).show();
                 return resolver;
@@ -200,7 +237,7 @@ public class BackgroundLocationService extends Service {
                 if(resolver != null){
                     //Toast.makeText( getApplicationContext(), "porque cambio el rumbo" ,Toast.LENGTH_LONG).show();
                     motivo = new JSObject();
-                    motivo.put("code", 3);
+                    motivo.put("code", 5);
                     motivo.put("message", "por cambio de rumbo a "+ settings.grados +" grados" );
                     return resolver;
                 }
@@ -243,7 +280,6 @@ public class BackgroundLocationService extends Service {
 
         public void onLocationChanged(final Location loc)
         {
-
             try{
                 ServiceSettings settingData = (ServiceSettings) localStorage.getObject("settingData");
                 if( settingData != null) {
@@ -251,11 +287,17 @@ public class BackgroundLocationService extends Service {
                 }
                 Location trama = null;
                 if(loc != null )
-                    trama = isBetterLocation(loc, lastLocationSending);
+                  try {
+                      if(bufferTramas.size() > 0)
+                      if(bufferTramas.get(0) == null ){
+                          bufferTramas.clear();
+                      }
+                      trama = isBetterLocation(loc, lastLocationSending);
+                  }catch ( Error error ){
+                      bitacoraManager.guardarEvento("Error al obtener la mejor trama",12, error.getMessage());
+                  }
 
                 if( trama != null ) {
-
-                    bufferTramas = new ArrayList<>();
                     String pos = "si";
                     IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
                     Intent batteryStatus = context.registerReceiver(null, ifilter);
@@ -272,11 +314,10 @@ public class BackgroundLocationService extends Service {
                         throw new RuntimeException(e);
                     }
                     if( lastLocationSending != null &&  trama.getAccuracy() > accuracy   ) {
-                        System.out.println( "salto por la mala ubicacion");
-                        if( lastLocationSending.distanceTo(trama) < ((Math.round(trama.getAccuracy()) + Math.round(lastLocationSending.getAccuracy()))) *1.1 && trama.getAccuracy() * 3 > accuracy ){
+                        if( lastLocationSending.distanceTo(trama) < ((Math.round(trama.getAccuracy()) + Math.round(lastLocationSending.getAccuracy()))) *1.3 && trama.getAccuracy() * 2 > accuracy ){
                             pos = "no";
                             int param = 0;
-                            if(lastLocationSending.getAccuracy() > trama.getAccuracy() * 1.2 ){
+                            if(lastLocationSending.getAccuracy() > trama.getAccuracy() * 1.3 ){
                                 pos = "si mas preciso";
                             } else {
                                 trama.setLatitude(lastLocationSending.getLatitude());
@@ -301,101 +342,41 @@ public class BackgroundLocationService extends Service {
                     location.put("time", trama.getTime());
                     location.put("battery",batteryPct);
                     JSObject senData = new JSObject();
-                    System.out.println(loc.getProvider());
                     senData.put("userID",settings.userID);
                     senData.put("urlRequest",settings.urlRequests);
-                    System.out.println( "Accuracy => " +  loc.getAccuracy());
-
                     if(settings.authorization != null )
                         senData.put("auth", settings.authorization );
                     else
                         senData.put("auth", "");
                     senData.put( "trama",location);
-
-                    try {
-                        String localTramas = localStorage.getItem("localTramas");
-                        tramasAllLocal =  new JSONArray(localTramas);
-                    } catch (Exception e ){
-                        tramasAllLocal = new JSONArray();
-                    }
                     if(settings.storageLocal){
-                        tramasAllLocal.put(location);
-                        localStorage.setItem("localTramas",tramasAllLocal.toString());
+                        bitacoraManager.guardarEvento("datos de posición "+ pos+" precisión "+ Math.round(trama.getAccuracy()),motivo.getInteger("code"),motivo.getString("message"));
                     }
-
-                    JSONArray bitacora = new JSONArray();
-                    try {
-                        String localTramas = localStorage.getItem("bitacora");
-                        bitacora =  new JSONArray(localTramas);
-                    } catch (Exception e ){
-                        bitacora = new JSONArray();
-                    }
-                    if(settings.storageLocal){
-                        JSObject evento = new JSObject();
-                        evento.put("razon","datos "+ pos+" precisión "+ Math.round(trama.getAccuracy()));
-                        evento.put("motivo",motivo);
-                        evento.put("fecha",trama.getTime());
-                        System.out.println(evento);
-                        System.out.println(bitacora.length());
-                        if(bitacora.length() > 91){
-                            JSONArray bit =  new JSONArray();
-                            for (int i = bitacora.length() -89 ; i < bitacora.length() ; i++ ){
-                                try {
-                                    bit.put(bitacora.get(i));
-                                } catch (JSONException e) {
-                                    throw new RuntimeException(e);
-                                }
-                            }
-                            bitacora = bit;
-                        }
-                        bitacora.put(evento);
-                        localStorage.setItem("bitacora",bitacora.toString());
-                    }
-
                     System.out.println("se envia la trama");
-                    System.out.println(senData);
                     lastSendingAt = new Date().getTime();
                     if ( settings.urlRequests != "" ) {
                         try{
+                            System.out.println("256 agregando trama");
                             tramaStorage.agregarTrama(senData);
-                        } catch ( Exception err ){
+                        } catch ( Error err ){
                             System.out.println(err);
                             System.out.println("un error");
+                            if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+                                restearVariables();
+                            } else {
+                                RESTARTSERVICE = true;
+                                Intent ser = new Intent(context, BackgroundLocationService.class);
+                                ser.setAction("ACTION.RESTARTFOREGROUND_ACTION");
+                                context.startService(ser);
+                            }
+
                         }
                     }
                     //.makeText( context, "entrada tomada" , Toast.LENGTH_SHORT ).show();
                 }
 
             }catch (Error error){
-                JSONArray bitacora = new JSONArray();
-                try {
-                    String localTramas = localStorage.getItem("bitacora");
-                    bitacora =  new JSONArray(localTramas);
-                } catch (Exception e ){
-                    bitacora = new JSONArray();
-                }
-                JSObject motivo = new JSObject();
-                motivo.put("code","12");
-                motivo.put("message", error.getMessage());
-                JSObject evento = new JSObject();
-                evento.put("razon","Servicio destruido");
-                evento.put("motivo",motivo);
-                evento.put("fecha",new Date().getTime());
-                System.out.println(evento);
-                if(bitacora.length() > 91){
-                    JSONArray bit =  new JSONArray();
-                    for (int i = bitacora.length() -89 ; i < bitacora.length() ; i++){
-                        try {
-                            bit.put(bitacora.get(i));
-                        } catch (JSONException e) {
-                            throw new RuntimeException(e);
-                        }
-                    }
-                    bitacora = bit;
-                }
-
-                bitacora.put(evento);
-                localStorage.setItem("bitacora",bitacora.toString());
+                bitacoraManager.guardarEvento("Servicio destruido",10,error.getMessage());
             };
         }
 
@@ -416,7 +397,10 @@ public class BackgroundLocationService extends Service {
         }
     }
 
-
+    public void stopService(){
+        stopForeground(true);
+        stopSelfResult(startId);
+    }
     @Override
     public IBinder onBind(Intent arg0) {
         return binder;
@@ -428,40 +412,57 @@ public class BackgroundLocationService extends Service {
             locationManager.removeUpdates(listenerGPS);
         if(listenerNetwork != null)
             locationManager.removeUpdates(listenerNetwork);
-
+        stopTimer();
         //Toast.makeText(this, "Traker Detenido", Toast.LENGTH_LONG).show();
-        JSONArray bitacora = new JSONArray();
-        try {
-            String localTramas = localStorage.getItem("bitacora");
-            bitacora =  new JSONArray(localTramas);
-        } catch (Exception e ){
-            bitacora = new JSONArray();
-        }
-        JSObject motivo = new JSObject();
-        motivo.put("code","08");
-        motivo.put("message", "Tracker detenido");
-        JSObject evento = new JSObject();
-        evento.put("razon","Servicio destruido");
-        evento.put("motivo",motivo);
-        evento.put("fecha",new Date().getTime());
-        System.out.println(evento);
-        if(bitacora.length() > 91){
-            JSONArray bit =  new JSONArray();
-            for (int i = bitacora.length() -89 ; i < bitacora.length() ; i++ ){
-                try {
-                    bit.put(bitacora.get(i));
-                } catch (JSONException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-            bitacora = bit;
-        }
-        bitacora.put(evento);
-        localStorage.setItem("bitacora",bitacora.toString());
+        bitacoraManager.guardarEvento("Servicio destruido",10,"Tracker detenido");
         Log.d("My Service", "onDestroy");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        final Future<Boolean> handler = executor.submit(() -> restartService());
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                handler.get( 300 , TimeUnit.MILLISECONDS);
+            }
+        } catch (TimeoutException e) {
+            handler.cancel(true);
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+        executor.shutdownNow();
+
         super.onDestroy();
     }
-
+    public Boolean restartService(){
+        if(RESTARTSERVICE){
+            RESTARTSERVICE = false;
+            Intent intent = new Intent(context, BackgroundLocationService.class);
+            intent.setAction("ACTION.STARTFOREGROUND_ACTION");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        }
+        return true;
+    }
+    public void restearVariables(){
+        System.out.println("reseteando variables");
+        serviceStarterAt = new Date().getTime();
+        localStorage = new LocalStorage(this);
+        bitacoraManager = new BitacoraManager(context);
+        settings = new ServiceSettings();
+        this.bufferTramas.clear();
+        try {
+            Http cc =  Http.getInstance(this);
+            cc.cancelAllRequests();
+            tramaStorage = new TramaStorage(this);
+        } catch (JSONException e) {
+            throw new RuntimeException(e);
+        }
+        RESTARTSERVICE = false;
+    }
     public class LocalBinder extends Binder {
         BackgroundLocationService getService(String id ) {
             return BackgroundLocationService.this;
@@ -469,11 +470,17 @@ public class BackgroundLocationService extends Service {
     }
 
 
-    @SuppressLint({"WrongConstant", "InvalidWakeLockTag", "MissingPermission"})
+    @SuppressLint({"WrongConstant", "InvalidWakeLockTag", "MissingPermission", "LongLogTag"})
     @RequiresApi(api = Build.VERSION_CODES.O)
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
 
+        if (intent != null && "ACTION.STOP_SERVICE".equals(intent.getAction())) {
+            Log.i("BackgroundLocationService", "Stopping service on request");
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
 
         if(intent == null){
             intent = new Intent(context, BackgroundLocationService.class);
@@ -483,15 +490,6 @@ public class BackgroundLocationService extends Service {
         if (intent.getAction().equals("ACTION.STARTFOREGROUND_ACTION")) {
             motivo.put("code", 0 );
             motivo.put("message", "no coorresponde ningun motivo");
-            try {
-                String localTramas = localStorage.getItem("localTramas");
-                if(localTramas != "")
-                    tramasAllLocal = new JSONArray(localTramas);
-                else
-                    tramasAllLocal = new JSONArray();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
             System.out.println("el servicio se esta activando gracias al action");
             ServiceSettings settingData = (ServiceSettings) this.localStorage.getObject("settingData");
             if( settingData != null) {
@@ -499,11 +497,12 @@ public class BackgroundLocationService extends Service {
             }
             this.startId = startId;
             locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            /*
             LocationRequest locationRequest = LocationRequest.create();
             locationRequest.setInterval(1000);
             locationRequest.setFastestInterval(500);
             locationRequest.setPriority(LocationRequest.PRIORITY_BALANCED_POWER_ACCURACY);
-
+            */
 
             //listenerNetwork = new MyLocationListener();
             listenerGPS = new MyLocationListener();
@@ -511,11 +510,9 @@ public class BackgroundLocationService extends Service {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 return 0;
             }
-            bufferTramas = new ArrayList<>();
-            System.out.println(locationManager.getAllProviders());
+            bufferTramas.clear();
             //locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER,  3000 , 0, listenerNetwork);
             serviceStarterAt = new Date().getTime();
-            System.out.println(locationManager.getAllProviders());
             LocationCallback locationCallback = new LocationCallback() {
                 @Override
                 public void onLocationResult(LocationResult locationResult) {
@@ -529,28 +526,11 @@ public class BackgroundLocationService extends Service {
                     }
                 }
             };
-            LocationServices.getFusedLocationProviderClient(this).requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper());
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 90, 0, listenerGPS);
+            //LocationServices.getFusedLocationProviderClient(this).requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper());
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listenerGPS);
             Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            listenerGPS.onLocationChanged(loc);
-            new Timer().scheduleAtFixedRate(new TimerTask(){
-                @SuppressLint("MissingPermission")
-                @Override
-                public void run(){
-                    if(lastSendingAt != 0){
-                        long timeDelta = new Date().getTime() - lastSendingAt;
-                        System.out.println("timer => " + timeDelta);
-                        if(timeDelta > settings.minS *1.2 * 1000 ){
-                            System.out.println("aca el voy a reenviar la ultima posi conocida");
-                           Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                           if(loc != null){
-                               loc.setTime(new Date().getTime());
-                            listenerLocation.onLocationChanged(loc);
-                           }
-                        }
-                    }
-                }
-            },0,settings.minS * 1000);
+            listenerLocation.onLocationChanged(loc);
+             startTimer();
 
             //locationManager.requestLocationUpdates(LocationManager.	FUSED_PROVIDER, 120 , 0, listenerLocation);
            /**
@@ -565,6 +545,16 @@ public class BackgroundLocationService extends Service {
                 //your end servce code
                 stopForeground(true);
                 stopSelfResult(startId);
+            } else if (intent.getAction().equals( "ACTION.RESTARTFOREGROUND_ACTION")) {
+                System.out.println("el servicio se detuvo gracias al action");
+                //your end servce code
+                if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+                    restearVariables();
+                } else {
+                    RESTARTSERVICE = true;
+                    stopForeground(true);
+                    stopSelfResult(startId);
+                }
             }
         }
         //return super.onStartCommand(intent, flags, startId);
@@ -574,11 +564,10 @@ public class BackgroundLocationService extends Service {
     @RequiresApi(api = Build.VERSION_CODES.O)
     @Override
     public void onCreate()  {
-        intent = new Intent(BROADCAST_ACTION);
         context = this;
+
         try {
             this.tramaStorage = new TramaStorage(this);
-
         } catch (JSONException e) {
             e.printStackTrace();
         }
@@ -643,7 +632,7 @@ public class BackgroundLocationService extends Service {
         }
 
         Notification build = builder.build();
-        // this.noty = build;
+        this.noty = build;
         return build;
 
     }
@@ -698,12 +687,59 @@ public class BackgroundLocationService extends Service {
                 getPackageName()
         );
     }
+
     private String getAppString(String name, String fallback) {
         int id = getAppResourceIdentifier(name, "string");
         return id == 0 ? fallback : getString(id);
     }
 
-    private void setLocalData(){
-        localStorage.getItem("notification");
+    private void startTimer() {
+        stopTimer(); // Asegurar que no hay timers activos
+        timer = new Timer();
+        timerTask = new TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    if(new Date().getTime() > serviceStarterAt + 1800000 ){
+                        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+                            restearVariables();
+                        } else {
+                            System.out.println("reseteando servicio");
+                            RESTARTSERVICE = true;
+                            Intent ser = new Intent(context, BackgroundLocationService.class);
+                            ser.setAction("ACTION.RESTARTFOREGROUND_ACTION");
+                            context.startService(ser);
+                        }
+                    }
+                    Location locthis = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    if(locthis != null){
+                        locthis.setTime(new Date().getTime());
+                        listenerLocation.onLocationChanged(locthis);
+                    } else {
+                        locthis = isBetterLocationinArray(true);
+                        if(locthis != null) {
+                            locthis.setTime(new Date().getTime());
+                            listenerLocation.onLocationChanged(locthis);
+                        }
+                    }
+                } catch (Exception e) {
+                    bitacoraManager.guardarEvento("Error en timer", 501, e.getMessage());
+                }
+            }
+        };
+        timer.schedule(timerTask, 1800000);
     }
+
+    private void stopTimer() {
+        if (timerTask != null) {
+            timerTask.cancel();
+            timerTask = null;
+        }
+        if (timer != null) {
+            timer.cancel();
+            timer.purge();
+            timer = null;
+        }
+    }
+
 }

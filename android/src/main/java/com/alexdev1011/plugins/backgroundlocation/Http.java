@@ -1,6 +1,5 @@
 package com.alexdev1011.plugins.backgroundlocation;
 
-import android.annotation.SuppressLint;
 import android.content.Context;
 import android.util.Log;
 
@@ -11,7 +10,6 @@ import com.android.volley.Response;
 import com.android.volley.VolleyError;
 import com.android.volley.toolbox.JsonObjectRequest;
 import com.android.volley.toolbox.Volley;
-import com.getcapacitor.JSObject;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -19,87 +17,114 @@ import org.json.JSONObject;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 public class Http {
-    public interface CallBack{
-        void onSuccess(JSONObject response );
 
-        void onError(VolleyError error, JSONArray object ) throws JSONException;
+    private static Http instance;
+    private RequestQueue queue;
+    private Context context;
+
+    // Constructor privado para forzar singleton
+    private Http(Context context) {
+        this.context = context.getApplicationContext();
+        queue = Volley.newRequestQueue(this.context);
     }
-    public void get(String url, CallBack callback , Context context  ){
 
-       // Instantiate the RequestQueue.
-       RequestQueue queue = Volley.newRequestQueue(context);
+    // Método sincronizado para obtener la instancia única
+    public static synchronized Http getInstance(Context context) {
+        if (instance == null) {
+            instance = new Http(context);
+            Log.d("Http", "Nueva instancia creada");
+        }
+        return instance;
+    }
 
+    // Método para reiniciar la instancia (reinicia la cola)
+    public static synchronized void resetHttpInstance(Context context) {
+        if (instance != null) {
+            Log.d("Http", "Reiniciando instancia existente");
+            instance.resetInstance();
+        } else {
+            Log.d("Http", "Creando nueva instancia al resetear");
+            instance = new Http(context);
+        }
+    }
 
-       // Request a string response from the provided URL.
-       JsonObjectRequest jsArrayRequest = new JsonObjectRequest(
-               Request.Method.GET,
-               url,
-               null,
-               new Response.Listener<JSONObject>() {
-                   @Override
-                   public void onResponse(JSONObject response) {
-                       callback.onSuccess(response);
-                   }
+    // Reinicia la cola de requests cancelando todas las solicitudes pendientes
+    private void resetInstance() {
+        if (queue != null) {
+            queue.cancelAll(request -> true); // Cancela todas las requests
+            queue = Volley.newRequestQueue(context);
+            Log.d("Http", "RequestQueue reiniciada");
+        }
+    }
 
+    public interface CallBack {
+        void onSuccess(JSONObject response);
 
-               },
-               new Response.ErrorListener() {
-                   @Override
-                   public void onErrorResponse(VolleyError error) {
-                       Log.d("HTTPRE", "Error Respuesta en JSON: " + error.getMessage());
+        void onError(VolleyError error, JSONArray object) throws JSONException;
+    }
 
-                   }
-               }
-       );
+    public void get(String url, CallBack callback) {
+        JsonObjectRequest request = new JsonObjectRequest(
+                Request.Method.GET,
+                url,
+                null,
+                response -> callback.onSuccess(response),
+                error -> {
+                    // EXTRAER Y LOGUEAR CUERPO DE ERROR
+                    String errorBody = null;
+                    if (error.networkResponse != null && error.networkResponse.data != null) {
+                        errorBody = new String(error.networkResponse.data, StandardCharsets.UTF_8);
+                        Log.e("Http", "Error body: " + errorBody);
+                    }
 
-       // Add the request to the RequestQueue.
-       queue.add(jsArrayRequest);
-   }
+                    try {
+                        callback.onError(error, null);
+                    } catch (JSONException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+        );
+        queue.add(request);
+    }
 
-   public void post(String url, CallBack callback , Context context , JSONObject object , String authorization ){
-       RequestQueue queue = Volley.newRequestQueue(context);
-       JSObject data = new JSObject();
-       // Request a string response from the provided URL.
-       System.out.println("dentro del post =>");
-       System.out.println(url);
-       System.out.println(object);
-       JsonObjectRequest jsArrayRequest = new JsonObjectRequest(
-               Request.Method.POST,
-               url,
-               object,
-               new Response.Listener<JSONObject>() {
-                   @Override
-                   public void onResponse(JSONObject response) {
-                       callback.onSuccess(response);
-                   }
+    public void post(String url, CallBack callback, JSONObject object, String authorization) {
+        JsonObjectRequest request = new JsonObjectRequest(
+                Request.Method.POST,
+                url,
+                object,
+                response -> callback.onSuccess(response),
+                error -> {
+                    // EXTRAER Y LOGUEAR CUERPO DE ERROR AQUÍ
+                    String errorBody = null;
+                    if (error.networkResponse != null && error.networkResponse.data != null) {
+                        errorBody = new String(error.networkResponse.data, StandardCharsets.UTF_8);
+                        Log.e("Http", "Error body: " + errorBody);
+                    }
 
+                    try {
+                        callback.onError(error, object != null ? object.getJSONArray("reports") : null);
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                    }
+                }
+        ) {
+            @Override
+            public Map<String, String> getHeaders() throws AuthFailureError {
+                Map<String, String> params = new HashMap<>();
+                if (authorization != null) {
+                    params.put("Authorization", authorization);
+                }
+                return params;
+            }
+        };
 
-               },
-               new Response.ErrorListener() {
-                   @Override
-                   public void onErrorResponse(VolleyError error) {
-                       try {
-                           callback.onError(error, object.getJSONArray("reports"));
-                       } catch (JSONException e) {
-                           e.printStackTrace();
-                       }
-                       Log.d("HTTPRE", "Error Respuesta en JSON: " + error);
-                   }
-               }) {
-               @SuppressLint("SuspiciousIndentation")
-               @Override
-               public Map<String, String> getHeaders() throws AuthFailureError {
-                   Map<String, String>  params = new HashMap<String, String>();
-                   if( authorization != null )
-                   params.put("Authorization", authorization);
-                   return params;
-               }
-       };
+        queue.add(request);
+    }
 
-       // Add the request to the RequestQueue.
-       queue.add(jsArrayRequest);
-   }
-
+    public void cancelAllRequests() {
+        queue.cancelAll(request -> true);
+    }
 }

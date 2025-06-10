@@ -13,6 +13,7 @@ npx cap sync
 
 <docgen-index>
 
+* [`setMotivo(...)`](#setmotivo)
 * [`echo(...)`](#echo)
 * [`panic()`](#panic)
 * [`status(...)`](#status)
@@ -28,6 +29,19 @@ npx cap sync
 
 <docgen-api>
 <!--Update the source file JSDoc comments and rerun docgen to update the docs below-->
+
+### setMotivo(...)
+
+```typescript
+setMotivo(motivo: { code: number; message: string; }) => void
+```
+
+| Param        | Type                                            |
+| ------------ | ----------------------------------------------- |
+| **`motivo`** | <code>{ code: number; message: string; }</code> |
+
+--------------------
+
 
 ### echo(...)
 

@@ -3,6 +3,12 @@ import { WebPlugin } from '@capacitor/core';
 import type { BackgroundLocationPlugin, Location,WatcherOptions } from './definitions';
 
 export class BackgroundLocationWeb extends WebPlugin implements BackgroundLocationPlugin {
+
+  setMotivo( motivo : { code : number, message : string } ){
+    console.log(motivo);
+    
+  }
+
   getBitacora(callback: (bitacora: any[]) => void): void {
     callback([]);
   }
