@@ -54,6 +54,14 @@ public class AutoStartBackgroundLocation extends BroadcastReceiver {
                 );
             }
 
+            // Agregar acción para reinicio automático
+            if ("YouWillNeverKillMe".equals(action)) {
+                Log.d(TAG, "Reinicio automático solicitado");
+                comprobarYIniciarServicio(context);
+                result.finish();
+                return;
+            }
+
             if ("TU.ACCION.PARA.PARAR".equals(action)) {
                 stopBackgroundService(context);
                 result.finish();

@@ -127,7 +127,7 @@ public class BackgroundLocationPlugin extends Plugin {
 
     public void scheduleServiceMonitor(Context context) {
         PeriodicWorkRequest workRequest =
-                new PeriodicWorkRequest.Builder(LocationServiceMonitorWorker.class, 15, TimeUnit.MINUTES)
+                new PeriodicWorkRequest.Builder(LocationServiceMonitorWorker.class, 15,TimeUnit.MINUTES)
                         .build();
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
@@ -348,26 +348,17 @@ public class BackgroundLocationPlugin extends Plugin {
 
     @PluginMethod(returnType=PluginMethod.RETURN_CALLBACK)
     public void getBitacora(PluginCall call) throws JSONException {
-        try {
-            Process process = Runtime.getRuntime().exec("logcat ActivityManager:io.ionic.starter:D *:I  -d");
-            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            log = new JSONArray();
-            String line = "";
-            while ((line = bufferedReader.readLine()) != null && log.length() < 7000 ) {
-                //if(line.indexOf("E AndroidRuntime:") != -1)
-                    log.put(line);
-            }
-        } catch (IOException e) {
-            // Handle Exception
-        }
+        // Eliminado el uso de logcat que causa problemas de SELinux
+        // Usar solo la bitácora interna del sistema
         JSObject data = new JSObject();
         try {
             JSONArray bitacora = bitacoraManager.obtenerBitacora();
             data.put("bitacora",  bitacora);
-            data.put("console",log);
+            data.put("console", new JSONArray()); // Array vacío en lugar de logcat
             call.resolve(data);
         } catch (Exception e ){
             data.put("bitacora",  new JSONArray());
+            data.put("console", new JSONArray());
             call.resolve(data);
         }
     }
@@ -492,13 +483,7 @@ public class BackgroundLocationPlugin extends Plugin {
     public void load() {
         super.load();
         System.out.println("reload");
-        Process process = null;
-
-        try {
-            process = Runtime.getRuntime().exec("logcat ActivityManager:io.ionic.starter:D *:I  -d");
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        // Eliminado el uso de logcat que causa problemas de SELinux
 
         this.localStorage = new LocalStorage(this.getContext());
         this.bitacoraManager  = new BitacoraManager(this.getContext());

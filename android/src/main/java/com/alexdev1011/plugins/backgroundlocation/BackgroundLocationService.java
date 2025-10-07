@@ -2,6 +2,7 @@ package com.alexdev1011.plugins.backgroundlocation;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -19,6 +20,7 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.RequiresApi;
@@ -46,53 +48,90 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 public class BackgroundLocationService extends Service {
+    // Notificación del servicio en primer plano
     private Notification noty;
+    // Binder para la comunicación con el servicio
     private final IBinder binder = new LocalBinder();
+    // Almacenamiento local para configuraciones
     private LocalStorage localStorage = new LocalStorage(this);
+    // Configuraciones del servicio de ubicación
     public ServiceSettings settings = new ServiceSettings();
+    // Motivo del envío de la ubicación actual
     private JSObject motivo = new JSObject();
+    // ID único para la notificación del servicio
     private static final int NOTIFICATION_ID = 45023;
+    // Gestor de ubicación del sistema Android
     public LocationManager locationManager;
+    // Listeners para diferentes proveedores de ubicación
     public MyLocationListener listenerNetwork;
     public MyLocationListener listenerGPS;
     public MyLocationListener listenerLocation;
+    // Gestor para almacenar y enviar tramas de ubicación
     public TramaStorage tramaStorage;
+    // Contexto de la aplicación
     private Context context;
+    // Última ubicación enviada al servidor
     public Location lastLocationSending = null;
-    private static final int MAX_BUFFER_SIZE = 1000; // Ajustar según necesidades
+    // Tamaño máximo del buffer de ubicaciones
+    private static final int MAX_BUFFER_SIZE = 1000; 
+    // Buffer para almacenar ubicaciones recientes
     private List<Location> bufferTramas = new ArrayList<Location>();
+    // ID de inicio del servicio
     int startId = 0;
+    // Precisión mínima requerida en metros
     private int accuracy = 15;
+    // Timestamp de cuando se inició el servicio
     long serviceStarterAt = 0;
+    // Timestamp del último envío de ubicación
     long lastSendingAt = 0;
+    // Timer para tareas programadas
     private Timer timer;
     private TimerTask timerTask;
+    // Bandera para reiniciar el servicio
     private Boolean RESTARTSERVICE = false;
+    // Gestor para registrar eventos y logs
     private BitacoraManager bitacoraManager = new BitacoraManager(this);
+    // Contador de ubicaciones repetidas para detectar GPS atascado
+    private int repeatedLocationCount = 0;
+    // Última ubicación recibida para comparar
+    private Location lastReceivedLocation = null;
+    // Máximo número de ubicaciones repetidas antes de reiniciar
+    private static final int MAX_REPEATED_LOCATIONS = 5;
 
+    /**
+     * Obtiene la mejor ubicación del buffer de ubicaciones almacenadas
+     * @param force Si es true, devuelve la mejor ubicación sin importar la precisión
+     * @return La mejor ubicación disponible o null si no hay ninguna válida
+     */
     protected Location isBetterLocationinArray(Boolean force) {
         Location tramaDeRetorno = null;
         
         try {
-            // Limitar tamaño del buffer
+            // Limitar el tamaño del buffer para evitar uso excesivo de memoria
             if (bufferTramas.size() > MAX_BUFFER_SIZE) {
                 bufferTramas = bufferTramas.subList(bufferTramas.size() - MAX_BUFFER_SIZE, bufferTramas.size());
             }
 
+            // Recorrer el buffer para encontrar la mejor ubicación
             for(int i = 0; i < bufferTramas.size(); i++) {
                 if(tramaDeRetorno == null) {
                     tramaDeRetorno = bufferTramas.get(i);
                 } else {
                     if(bufferTramas.get(i) != null && tramaDeRetorno != null) {
+                        // Calcular diferencia de tiempo entre ubicaciones
                         long timeDelta = bufferTramas.get(i).getTime() - tramaDeRetorno.getTime();
                         boolean isNewer = timeDelta > 0;
+                        // Calcular diferencia de precisión
                         int accuracyDelta = (int) (bufferTramas.get(i).getAccuracy() - tramaDeRetorno.getAccuracy());
                         boolean isLessAccurate = accuracyDelta > 0;
                         boolean isMoreAccurate = accuracyDelta < 0;
-                        boolean isSignificantlyLessAccurate = accuracyDelta > 1;
+                        boolean isSignificantlyLessAccurate = accuracyDelta > 2;
+                        
+                        // Priorizar ubicaciones más precisas
                         if(isMoreAccurate){
                             tramaDeRetorno = bufferTramas.get(i);
-                        }else if( isNewer && !isLessAccurate ){
+                        }else if( isNewer && !isSignificantlyLessAccurate ){
+                            // Si es más nueva y no menos precisa, usar esta ubicación
                             tramaDeRetorno = bufferTramas.get(i);
                         }
                     }
@@ -100,18 +139,28 @@ public class BackgroundLocationService extends Service {
             }
         } catch (Error error) {
             bitacoraManager.guardarEvento("Error en buffer", 500, error.getMessage());
-            bufferTramas.clear(); // Limpiar en lugar de crear nueva lista
+            bufferTramas.clear(); // Limpiar buffer en caso de error
         }
+        
         if(tramaDeRetorno == null) {
             motivo = new JSObject();
             return null;
         }
+        
+        // Si se fuerza el retorno o la precisión es suficiente, devolver la ubicación
         if(force )
             return tramaDeRetorno;
         if( tramaDeRetorno.getAccuracy() < accuracy )
             return tramaDeRetorno;
         else return null;
     }
+
+    /**
+     * Determina si una nueva ubicación es mejor que la anterior
+     * @param location Nueva ubicación recibida
+     * @param lastLocationSending Última ubicación enviada
+     * @return La mejor ubicación si cumple los criterios, null en caso contrario
+     */
     protected Location isBetterLocation(Location location, Location lastLocationSending ) {
 
         if(location == null ){
@@ -120,27 +169,26 @@ public class BackgroundLocationService extends Service {
 
         long deltaTime = 0;
 
+        // Limpiar buffer si las ubicaciones son muy antiguas (más de 4 segundos)
         if(this.bufferTramas.size() > 2 ){
             deltaTime = location.getTime() - this.bufferTramas.get(0).getTime();
             if( deltaTime > 4000  ){
                 this.bufferTramas.remove(0);
             }
         }
+        
+        // Agregar nueva ubicación al buffer
         try{
             this.bufferTramas.add(location);
         }catch (Error err){
+            // Reinicializar buffer en caso de error
             this.bufferTramas = new ArrayList<Location>();
             this.bufferTramas.add(location);
             System.out.println(err);
             return null;
         }
 
-
-        /*
-        if((this.bufferTramas.size() < 3 || deltaTime < 4000 ) && lastLocationSending != null ){
-            return null;
-        }
-        */
+        // Verificar si hay un motivo específico para enviar la ubicación
         try {
             Object obg =  this.localStorage.getObject("motivo");
             if(obg != null){
@@ -159,30 +207,34 @@ public class BackgroundLocationService extends Service {
             Log.e("error",error.getMessage());
         }
 
-
+        // Verificar si se debe detener el servicio
         if(settings.stopService){
-           // toast.makeText( context, "serivico detenido ultima trama " , Toast.LENGTH_SHORT ).show();
             motivo = new JSObject();
             motivo.put("code", 1002);
             motivo.put("message", "serivico detenido ultima trama");
-            Location resolver = this.isBetterLocationinArray(true);
-            return resolver;
+            return this.isBetterLocationinArray(true);
         }
 
+        // Verificar si está activado el modo pánico
         if(settings.panico){
-            //toast.makeText( context, "panico activado " , Toast.LENGTH_SHORT ).show();
             motivo = new JSObject();
             motivo.put("code", 51);
             motivo.put("message", "Panico activado");
-            Location resolver = this.isBetterLocationinArray(true);
-            return resolver;
+            return  this.isBetterLocationinArray(true);
         }
 
+        // Si no hay ubicación previa, cualquier ubicación nueva es mejor
         if (lastLocationSending == null ) {
-            // A new location is always better than no location
+            // Aplicar retraso de 20 segundos al inicio del trackeo para estabilizar el GPS
+            // Esto evita enviar ubicaciones imprecisas en los primeros momentos
+            long tiempoTranscurrido = new Date().getTime() - serviceStarterAt;
+            if (tiempoTranscurrido < 20000) { // 20 segundos = 20000 milisegundos
+                // No enviar trama aún, esperar el período de estabilización inicial
+                return null;
+            }
+            
             Location resolver = this.isBetterLocationinArray(true);
             if(resolver != null ) {
-                //Toast.makeText( getApplicationContext(), "porque es la primera" ,Toast.LENGTH_LONG).show();
                 motivo = new JSObject();
                 motivo.put("code", 1001);
                 motivo.put("message", "primer toma de contacto al activar el seguimiento");
@@ -192,50 +244,48 @@ public class BackgroundLocationService extends Service {
                 return null;
         }
 
-        // Check whether the new location fix is newer or older
+        // Verificar si ha pasado suficiente tiempo desde la última ubicación
         long timeDelta = new Date().getTime() - lastLocationSending.getTime();
         boolean isSignificantlyNewer = timeDelta > settings.minS * 1000;
         boolean isSignificantlyOlder = timeDelta < - settings.minS * 1000;
         boolean isNewer = timeDelta > 800;
 
+        // Calcular distancia entre ubicaciones
         float distBetweenLocation = location.distanceTo(lastLocationSending);
         boolean minDist = distBetweenLocation > settings.distanceFilter;
         boolean moreLength = location.distanceTo(lastLocationSending) > ( settings.distanceFilter * 10 / 100 ) ;
 
-        // If it's been more than two minutes since the current location, use the new location
-        // because the user has likely moved
-
-        // Check whether the new location fix is more or less accurate
+        // Verificar precisión de las ubicaciones
         int accuracyDelta = (int) (location.getAccuracy() - lastLocationSending.getAccuracy());
         boolean isLessAccurate = accuracyDelta > 0;
         boolean isMoreAccurate = accuracyDelta < 0;
         boolean isSignificantlyLessAccurate = accuracyDelta > 1;
 
-        // Check if the old and new location are from the same provider
+        // Verificar si ambas ubicaciones provienen del mismo proveedor
         boolean isFromSameProvider = isSameProvider(location.getProvider(),
                 lastLocationSending.getProvider());
 
-        if (isSignificantlyNewer) {
+
+        // Si ha pasado mucho tiempo, usar la nueva ubicación
+        if (isSignificantlyNewer && !isSignificantlyLessAccurate) {
             Location resolver = this.isBetterLocationinArray(true);
 
             if(resolver != null){
                 motivo = new JSObject();
                 motivo.put("code", 1000);
                 motivo.put("message", "por tiempo limite " + settings.minS +" segundos" );
-                //Toast.makeText( getApplicationContext(), "porque llego al tiempo limite " ,Toast.LENGTH_LONG).show();
                 return resolver;
             }
             else
                 return null;
-            // If the new location is more than two minutes older, it must be worse
         }
 
+        // Verificar cambio significativo en el rumbo/dirección
         float bearingCompare = location.getBearing() - lastLocationSending.getBearing();
         if(location.getProvider() != "fused" && lastLocationSending.getProvider() != "fused" && distBetweenLocation > accuracy){
             if( bearingCompare > settings.grados || bearingCompare < -settings.grados &&  isNewer ){
                 Location resolver = this.isBetterLocationinArray(true);
                 if(resolver != null){
-                    //Toast.makeText( getApplicationContext(), "porque cambio el rumbo" ,Toast.LENGTH_LONG).show();
                     motivo = new JSObject();
                     motivo.put("code", 5);
                     motivo.put("message", "por cambio de rumbo a "+ settings.grados +" grados" );
@@ -245,10 +295,11 @@ public class BackgroundLocationService extends Service {
                     return null;
             }
         }
+        
+        // Verificar si se ha alcanzado la distancia mínima configurada
         if ( minDist ) {
             Location resolver = this.isBetterLocationinArray(true);
             if(resolver != null){
-                //Toast.makeText( getApplicationContext(), "porque llego a la distancia objetivo" ,Toast.LENGTH_LONG).show();
                 motivo = new JSObject();
                 motivo.put("code", 4);
                 motivo.put("message", "por distancia " + settings.distanceFilter +" metros");
@@ -261,7 +312,12 @@ public class BackgroundLocationService extends Service {
         return null;
     }
 
-    /** Checks whether two providers are the same */
+    /** 
+     * Verifica si dos proveedores de ubicación son el mismo
+     * @param provider1 Primer proveedor a comparar
+     * @param provider2 Segundo proveedor a comparar
+     * @return true si son el mismo proveedor, false en caso contrario
+     */
     private boolean isSameProvider(String provider1, String provider2) {
         if (provider1 == null) {
             return provider2 == null;
@@ -269,115 +325,317 @@ public class BackgroundLocationService extends Service {
         return provider1.equals(provider2);
     }
 
+    /**
+     * Verifica si una ubicación es repetida (misma coordenada)
+     * @param newLocation Nueva ubicación recibida
+     * @return true si es repetida, false en caso contrario
+     */
+    private boolean isLocationRepeated(Location newLocation) {
+        if (lastReceivedLocation == null) {
+            lastReceivedLocation = newLocation;
+            return false;
+        }
+        
+        // Verificar si la ubicación es muy antigua (más de 5 minutos)
+        long currentTime = System.currentTimeMillis();
+        long locationAge = currentTime - newLocation.getTime();
+        if (locationAge > 300000) { // 5 minutos
+            bitacoraManager.guardarEvento("Ubicación muy antigua recibida", 1007, "Edad: " + (locationAge/1000) + " segundos");
+            return true; // Considerar como repetida para forzar reinicio
+        }
+        
+        // Verificar si la distancia es menor a 2 metros
+        float distance = newLocation.distanceTo(lastReceivedLocation);
+        if (distance < 2.0f) {
+            // Verificar también si el tiempo es muy similar
+            long timeDiff = Math.abs(newLocation.getTime() - lastReceivedLocation.getTime());
+            if (timeDiff < 2000) { // Menos de 2 segundos de diferencia
+                return true;
+            }
+        }
+        
+        lastReceivedLocation = newLocation;
+        return false;
+    }
 
+    /**
+     * Reinicia los servicios de ubicación de forma robusta
+     */
+    private void restartLocationServices() {
+        try {
+            // Detener listeners actuales
+            if (listenerGPS != null) {
+                locationManager.removeUpdates(listenerGPS);
+            }
+            if (listenerNetwork != null) {
+                locationManager.removeUpdates(listenerNetwork);
+            }
+            
+            // Limpiar variables
+            bufferTramas.clear();
+            repeatedLocationCount = 0;
+            lastReceivedLocation = null;
+            lastLocationSending = null;
+            
+            // Esperar un momento antes de reagregar
+            Thread.sleep(2000);
+            
+            // Reagregar listeners
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listenerGPS);
+            }
+            
+            bitacoraManager.guardarEvento("Servicios de ubicación reiniciados", 1005, "GPS desatascado");
+            
+        } catch (Exception e) {
+            bitacoraManager.guardarEvento("Error al reiniciar servicios", 500, e.getMessage());
+        }
+    }
+
+    // Acción de broadcast para comunicación entre componentes
     static final String ACTION_BROADCAST = (
             BackgroundLocationService.class.getPackage().getName() + ".broadcast"
     );
 
-
+    /**
+     * Listener personalizado para recibir actualizaciones de ubicación
+     * Implementa la interfaz LocationListener de Android
+     */
     public class MyLocationListener implements LocationListener
     {
-
-        public void onLocationChanged(final Location loc)
-        {
-            try{
-                ServiceSettings settingData = (ServiceSettings) localStorage.getObject("settingData");
-                if( settingData != null) {
-                    settings = settingData;
-                }
-                Location trama = null;
-                if(loc != null )
-                  try {
-                      if(bufferTramas.size() > 0)
-                      if(bufferTramas.get(0) == null ){
-                          bufferTramas.clear();
-                      }
-                      trama = isBetterLocation(loc, lastLocationSending);
-                  }catch ( Error error ){
-                      bitacoraManager.guardarEvento("Error al obtener la mejor trama",12, error.getMessage());
-                  }
-
-                if( trama != null ) {
-                    String pos = "si";
-                    IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-                    Intent batteryStatus = context.registerReceiver(null, ifilter);
-                    int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-                    int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-                    float batteryPct = level * 100 / (float)scale;
-                    JSObject location = new JSObject();
-                    location.put("panic",settings.panico);
-                    settings.panico = false;
-                    settings.stopService = false;
-                    try {
-                        localStorage.setObject("settingData" , settings );
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+        /**
+         * Método principal que se ejecuta cuando se recibe una nueva ubicación
+         * @param loc Nueva ubicación recibida del proveedor
+         */
+        public void onLocationChanged(final Location loc) {
+            try {
+                // NUEVA VALIDACIÓN: Detectar GPS atascado
+                if (isLocationRepeated(loc)) {
+                    repeatedLocationCount++;
+                    if (repeatedLocationCount > MAX_REPEATED_LOCATIONS) {
+                        bitacoraManager.guardarEvento("GPS atascado detectado", 1004, "Reiniciando servicios");
+                        // Usar método de reinicio robusto
+                        restartLocationServices();
+                        return;
                     }
-                    if( lastLocationSending != null &&  trama.getAccuracy() > accuracy   ) {
-                        if( lastLocationSending.distanceTo(trama) < ((Math.round(trama.getAccuracy()) + Math.round(lastLocationSending.getAccuracy()))) *1.3 && trama.getAccuracy() * 2 > accuracy ){
-                            pos = "no";
-                            int param = 0;
-                            if(lastLocationSending.getAccuracy() > trama.getAccuracy() * 1.3 ){
-                                pos = "si mas preciso";
-                            } else {
-                                trama.setLatitude(lastLocationSending.getLatitude());
-                                trama.setLongitude(lastLocationSending.getLongitude());
-                            }
-                        } else {
-                            pos = "si normal";
-                            location.put("latitude", trama.getLatitude());
-                            location.put("longitude", trama.getLongitude());
-                        }
+                } else {
+                    repeatedLocationCount = 0; // Resetear contador
+                }
+                
+                // Inicializar configuraciones del servicio
+                if (!initializeSettings()) return;
+                
+                // Procesar la nueva ubicación y determinar si es válida
+                Location trama = procesarNuevaUbicacion(loc);
+                if (trama == null) return;
+                
+                // Obtener nivel actual de batería
+                float batteryPct = obtenerNivelBateria();
+                // Crear objeto con datos de ubicación
+                JSObject location = crearObjetoUbicacion(trama, batteryPct);
+                // Determinar la precisión y ajustar coordenadas si es necesario
+                String pos = determinarPrecisionUbicacion(trama, location);
+                
+                // Preparar datos para envío al servidor
+                JSObject senData = crearDatosEnvio(location);
+                // Registrar evento en la bitácora si está habilitado
+                registrarEventoUbicacion(pos, trama);
+                // Enviar trama al sistema de almacenamiento
+                enviarTrama(senData);
+                
+            } catch (Error error) {
+                bitacoraManager.guardarEvento("Servicio destruido", 10, error.getMessage());
+            }
+        }
+
+        /**
+         * Inicializa las configuraciones del servicio desde el almacenamiento local
+         * @return true si se inicializó correctamente
+         */
+        private boolean initializeSettings() {
+            ServiceSettings settingData = (ServiceSettings) localStorage.getObject("settingData");
+            if (settingData != null) {
+                settings = settingData;
+            }
+            return true;
+        }
+
+        /**
+         * Procesa una nueva ubicación y determina si es mejor que las anteriores
+         * @param loc Nueva ubicación recibida
+         * @return La mejor ubicación disponible o null si no es válida
+         */
+        private Location procesarNuevaUbicacion(Location loc) {
+            Location trama = null;
+            if (loc != null) {
+                try {
+                    // Limpiar buffer si contiene elementos nulos
+                    if (bufferTramas.size() > 0 && bufferTramas.get(0) == null) {
+                        bufferTramas.clear();
+                    }
+                    // Determinar si la nueva ubicación es mejor que la anterior
+                    trama = isBetterLocation(loc, lastLocationSending);
+                } catch (Error error) {
+                    bitacoraManager.guardarEvento("Error al obtener la mejor trama", 12, error.getMessage());
+                }
+            }
+            return trama;
+        }
+
+        /**
+         * Obtiene el nivel actual de batería del dispositivo
+         * @return Porcentaje de batería (0-100)
+         */
+        private float obtenerNivelBateria() {
+            IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            Intent batteryStatus = context.registerReceiver(null, ifilter);
+            int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+            return level * 100 / (float) scale;
+        }
+
+        /**
+         * Crea el objeto JSObject con todos los datos de la ubicación
+         * @param trama Ubicación procesada
+         * @param batteryPct Nivel de batería actual
+         * @return Objeto JSObject con todos los datos de ubicación
+         */
+        private JSObject crearObjetoUbicacion(Location trama, float batteryPct) {
+            JSObject location = new JSObject();
+            // Incluir estado de pánico y resetear banderas
+            location.put("panic", settings.panico);
+            settings.panico = false;
+            settings.stopService = false;
+            
+            try {
+                // Guardar configuraciones actualizadas
+                localStorage.setObject("settingData", settings);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            
+            // Agregar todos los datos de la ubicación
+            location.put("reason", motivo);  // Motivo del envío
+            location.put("accuracy", Math.round(trama.getAccuracy()));  // Precisión en metros
+            location.put("altitude", Math.round(trama.getAltitude()));  // Altitud en metros
+            location.put("bearing", Math.round(trama.getBearing()));    // Rumbo en grados
+            location.put("provider", trama.getProvider());              // Proveedor de ubicación
+            location.put("speed", Math.round((trama.getSpeed() * 3.6))); // Velocidad en km/h
+            location.put("time", trama.getTime());                      // Timestamp
+            location.put("battery", batteryPct);                        // Nivel de batería
+            
+            return location;
+        }
+
+        /**
+         * Determina la precisión de la ubicación y ajusta las coordenadas si es necesario
+         * @param trama Ubicación a evaluar
+         * @param location Objeto JSObject donde se guardan las coordenadas
+         * @return String indicando el tipo de precisión ("si", "no", "si mas preciso", "si normal")
+         */
+        private String determinarPrecisionUbicacion(Location trama, JSObject location) {
+            String pos = "si";
+            
+            if (lastLocationSending != null && trama.getAccuracy() > accuracy) {
+                // Calcular si las ubicaciones están muy cerca considerando la precisión
+                if (lastLocationSending.distanceTo(trama) < ((Math.round(trama.getAccuracy()) + Math.round(lastLocationSending.getAccuracy()))) * 1.3 && trama.getAccuracy() * 2 > accuracy) {
+                    pos = "no";
+                    // Si la ubicación anterior es significativamente más precisa
+                    if (lastLocationSending.getAccuracy() > trama.getAccuracy() * 1.3) {
+                        pos = "si mas preciso";
                     } else {
-                        location.put("latitude", trama.getLatitude());
-                        location.put("longitude", trama.getLongitude());
+                        // Usar coordenadas de la ubicación anterior (más confiable)
+                        trama.setLatitude(lastLocationSending.getLatitude());
+                        trama.setLongitude(lastLocationSending.getLongitude());
                     }
-                    lastLocationSending = trama;
-                    location.put("reason", motivo);
-                    location.put("accuracy",Math.round(trama.getAccuracy()));
-                    location.put("altitude",Math.round(trama.getAltitude()));
-                    location.put("bearing", Math.round(trama.getBearing()));
-                    location.put("provider", trama.getProvider());
-                    location.put("speed",Math.round((trama.getSpeed() * 3.6)));
-                    location.put("time", trama.getTime());
-                    location.put("battery",batteryPct);
-                    JSObject senData = new JSObject();
-                    senData.put("userID",settings.userID);
-                    senData.put("urlRequest",settings.urlRequests);
-                    if(settings.authorization != null )
-                        senData.put("auth", settings.authorization );
-                    else
-                        senData.put("auth", "");
-                    senData.put( "trama",location);
-                    if(settings.storageLocal){
-                        bitacoraManager.guardarEvento("datos de posición "+ pos+" precisión "+ Math.round(trama.getAccuracy()),motivo.getInteger("code"),motivo.getString("message"));
-                    }
-                    System.out.println("se envia la trama");
-                    lastSendingAt = new Date().getTime();
-                    if ( settings.urlRequests != "" ) {
-                        try{
-                            System.out.println("256 agregando trama");
-                            tramaStorage.agregarTrama(senData);
-                        } catch ( Error err ){
-                            System.out.println(err);
-                            System.out.println("un error");
-                            if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
-                                restearVariables();
-                            } else {
-                                RESTARTSERVICE = true;
-                                Intent ser = new Intent(context, BackgroundLocationService.class);
-                                ser.setAction("ACTION.RESTARTFOREGROUND_ACTION");
-                                context.startService(ser);
-                            }
-
-                        }
-                    }
-                    //.makeText( context, "entrada tomada" , Toast.LENGTH_SHORT ).show();
+                } else {
+                    pos = "si normal";
+                    location.put("latitude", trama.getLatitude());
+                    location.put("longitude", trama.getLongitude());
                 }
+            } else {
+                // Usar las nuevas coordenadas directamente
+                location.put("latitude", trama.getLatitude());
+                location.put("longitude", trama.getLongitude());
+            }
+            
+            // Actualizar la última ubicación enviada
+            lastLocationSending = trama;
+            return pos;
+        }
 
-            }catch (Error error){
-                bitacoraManager.guardarEvento("Servicio destruido",10,error.getMessage());
-            };
+        /**
+         * Crea el objeto con todos los datos necesarios para el envío al servidor
+         * @param location Objeto JSObject con datos de ubicación
+         * @return Objeto JSObject listo para enviar
+         */
+        private JSObject crearDatosEnvio(JSObject location) {
+            JSObject senData = new JSObject();
+            senData.put("userID", settings.userID);           // ID del usuario
+            senData.put("urlRequest", settings.urlRequests);  // URL del servidor
+            // Incluir token de autorización si está disponible
+            if (settings.authorization != null) {
+                senData.put("auth", settings.authorization);
+            } else {
+                senData.put("auth", "");
+            }
+            senData.put("trama", location);  // Datos de ubicación
+            return senData;
+        }
+
+        /**
+         * Registra el evento de ubicación en la bitácora local si está habilitado
+         * @param pos Tipo de precisión de la ubicación
+         * @param trama Datos de ubicación
+         */
+        private void registrarEventoUbicacion(String pos, Location trama) {
+            if (settings.storageLocal) {
+                bitacoraManager.guardarEvento("datos de posición " + pos + " precisión " + Math.round(trama.getAccuracy()), motivo.getInteger("code"), motivo.getString("message"));
+            }
+        }
+
+        /**
+         * Envía la trama de ubicación al sistema de almacenamiento y maneja errores
+         * @param senData Datos completos listos para enviar
+         */
+        private void enviarTrama(JSObject senData) {
+            System.out.println("se envia la trama");
+            lastSendingAt = new Date().getTime();
+            
+            // Solo enviar si hay URL configurada
+            if (!settings.urlRequests.equals("")) {
+                try {
+                    System.out.println("256 agregando trama");
+                    tramaStorage.agregarTrama(senData);
+                } catch (Error err) {
+                    System.out.println(err);
+                    System.out.println("un error");
+                    // Manejar error según la versión de Android
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        if(listenerGPS != null)
+                            locationManager.removeUpdates(listenerGPS);
+                        if(listenerNetwork != null)
+                            locationManager.removeUpdates(listenerNetwork);
+
+                        restearVariables();
+
+                        // Reiniciar el servicio completo
+                        Intent restartIntent = new Intent(context, BackgroundLocationService.class);
+                        restartIntent.setAction("ACTION.STARTFOREGROUND_ACTION");
+                        context.startForegroundService(restartIntent);
+
+                        // Detener este servicio
+                        stopForeground(true);
+                        stopSelf();
+                    } else {
+                        // Reiniciar servicio en versiones anteriores
+                        RESTARTSERVICE = true;
+                        Intent ser = new Intent(context, BackgroundLocationService.class);
+                        ser.setAction("ACTION.RESTARTFOREGROUND_ACTION");
+                        context.startService(ser);
+                    }
+                }
+            }
         }
 
         @Override
@@ -434,6 +692,71 @@ public class BackgroundLocationService extends Service {
 
         super.onDestroy();
     }
+
+    @SuppressLint("LongLogTag")
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        Log.d("BG_LOCATION", "onTaskRemoved - Proceso matado por el OS");
+        Log.d("BG_LOCATION", "Intent action: " + (rootIntent != null ? rootIntent.getAction() : "null"));
+        bitacoraManager.guardarEvento("onTaskRemoved", 1003, "Proceso matado por el OS");
+        
+        // Programar reinicio automático
+        programarReinicioAutomatico();
+        
+        super.onTaskRemoved(rootIntent);
+    }
+
+    private void programarReinicioAutomatico() {
+        try {
+            Log.d("BG_LOCATION", "Programando reinicio automático");
+            
+            // Usar tu AutoStartBackgroundLocation existente
+            Intent restartIntent = new Intent("YouWillNeverKillMe");
+            Log.d("BG_LOCATION", "Intent de reinicio creado");
+            
+            // Crear PendingIntent para broadcast
+            PendingIntent restartPI = PendingIntent.getBroadcast(
+                this, 
+                1, 
+                restartIntent, 
+                PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_IMMUTABLE
+            );
+            Log.d("BG_LOCATION", "PendingIntent creado");
+            
+            // Programar reinicio con AlarmManager
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am != null) {
+                Log.d("BG_LOCATION", "AlarmManager obtenido");
+                
+                // Intentar con setExact primero (más confiable)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.setExactAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, 
+                        SystemClock.elapsedRealtime() + 2000, // 2 segundos
+                        restartPI
+                    );
+                    Log.d("BG_LOCATION", "AlarmManager.setExactAndAllowWhileIdle programado");
+                } else {
+                    am.setExact(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, 
+                        SystemClock.elapsedRealtime() + 2000, // 2 segundos
+                        restartPI
+                    );
+                    Log.d("BG_LOCATION", "AlarmManager.setExact programado");
+                }
+                
+                Log.d("BG_LOCATION", "AlarmManager programado para reinicio");
+                bitacoraManager.guardarEvento("AlarmManager programado", 1004, "Reinicio en 2 segundos");
+            } else {
+                Log.e("BG_LOCATION", "AlarmManager es null");
+                bitacoraManager.guardarEvento("AlarmManager null", 1005, "No se pudo obtener AlarmManager");
+            }
+        } catch (Exception e) {
+            Log.e("BG_LOCATION", "Error en programarReinicioAutomatico: " + e.getMessage());
+            bitacoraManager.guardarEvento("Error programarReinicioAutomatico", 1006, e.getMessage());
+        }
+    }
+
     public Boolean restartService(){
         if(RESTARTSERVICE){
             RESTARTSERVICE = false;
@@ -454,6 +777,9 @@ public class BackgroundLocationService extends Service {
         bitacoraManager = new BitacoraManager(context);
         settings = new ServiceSettings();
         this.bufferTramas.clear();
+        // Resetear variables de detección de GPS atascado
+        repeatedLocationCount = 0;
+        lastReceivedLocation = null;
         try {
             Http cc =  Http.getInstance(this);
             cc.cancelAllRequests();
@@ -470,7 +796,7 @@ public class BackgroundLocationService extends Service {
     }
 
 
-    @SuppressLint({"WrongConstant", "InvalidWakeLockTag", "MissingPermission", "LongLogTag"})
+    @SuppressLint({"WrongConstant", "In                                            WakeLockTag", "MissingPermission", "LongLogTag", "SuspiciousIndentation"})
     @RequiresApi(api = Build.VERSION_CODES.O)
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -487,7 +813,25 @@ public class BackgroundLocationService extends Service {
             intent.setAction("ACTION.STARTFOREGROUND_ACTION");
         }
 
+        // CRÍTICO: Llamar a startForeground() inmediatamente para cumplir con el requisito de Android
+        // Esto evita el error "Context.startForegroundService() did not then call Service.startForeground()"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Inicializar configuraciones antes de crear la notificación
+            ServiceSettings settingData = (ServiceSettings) this.localStorage.getObject("settingData");
+            if (settingData != null) {
+                this.settings = settingData;
+            }
+            
+            Notification notification = getNotification();
+            if (notification != null) {
+                startForeground(NOTIFICATION_ID, notification);
+                Log.i("BackgroundLocationService", "Foreground service started with notification");
+            }
+        }
+
         if (intent.getAction().equals("ACTION.STARTFOREGROUND_ACTION")) {
+            // onActivityStopped() ya no es necesario aquí porque startForeground() se llama arriba
+            // onActivityStopped(); // Comentado para evitar llamada redundante
             motivo.put("code", 0 );
             motivo.put("message", "no coorresponde ningun motivo");
             System.out.println("el servicio se esta activando gracias al action");
@@ -497,21 +841,12 @@ public class BackgroundLocationService extends Service {
             }
             this.startId = startId;
             locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            /*
-            LocationRequest locationRequest = LocationRequest.create();
-            locationRequest.setInterval(1000);
-            locationRequest.setFastestInterval(500);
-            locationRequest.setPriority(LocationRequest.PRIORITY_BALANCED_POWER_ACCURACY);
-            */
-
-            //listenerNetwork = new MyLocationListener();
             listenerGPS = new MyLocationListener();
             listenerLocation = new MyLocationListener();
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 return 0;
             }
             bufferTramas.clear();
-            //locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER,  3000 , 0, listenerNetwork);
             serviceStarterAt = new Date().getTime();
             LocationCallback locationCallback = new LocationCallback() {
                 @Override
@@ -526,19 +861,14 @@ public class BackgroundLocationService extends Service {
                     }
                 }
             };
-            //LocationServices.getFusedLocationProviderClient(this).requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper());
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listenerGPS);
             Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             listenerLocation.onLocationChanged(loc);
-             startTimer();
-
-            //locationManager.requestLocationUpdates(LocationManager.	FUSED_PROVIDER, 120 , 0, listenerLocation);
+            startTimer();
            /**
             *  if(this.settings.inBG)
             *      onActivityStopped();
             *                 */
-            //Toast.makeText(this, "Traker iniciado", Toast.LENGTH_LONG).show();
-            onActivityStopped();
         } else {
             if (intent.getAction().equals( "ACTION.STOPFOREGROUND_ACTION")) {
                 System.out.println("el servicio se detuvo gracias al action");
@@ -549,7 +879,22 @@ public class BackgroundLocationService extends Service {
                 System.out.println("el servicio se detuvo gracias al action");
                 //your end servce code
                 if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+                    if(listenerGPS != null)
+                        locationManager.removeUpdates(listenerGPS);
+                    if(listenerNetwork != null)
+                        locationManager.removeUpdates(listenerNetwork);
+                    
                     restearVariables();
+                    // Detener este servicio
+                    stopForeground(true);
+
+                     // Reiniciar el servicio completo
+                    Intent restartIntent = new Intent(context, BackgroundLocationService.class);
+                    restartIntent.setAction("ACTION.STARTFOREGROUND_ACTION");
+                    context.startForegroundService(restartIntent);
+        
+
+                    stopSelf();
                 } else {
                     RESTARTSERVICE = true;
                     stopForeground(true);
@@ -672,9 +1017,11 @@ public class BackgroundLocationService extends Service {
     }
     @RequiresApi(api = Build.VERSION_CODES.O)
     void onActivityStopped() {
+        // Este método se mantiene para compatibilidad y uso futuro
+        // pero ya no se llama en el flujo principal para evitar redundancia
         Notification notification = getNotification();
         if (notification != null) {
-            System.out.println("mostrando la notificación" );
+            System.out.println("mostrando la notificación");
             startForeground(NOTIFICATION_ID, notification);
         }
     }
@@ -694,13 +1041,27 @@ public class BackgroundLocationService extends Service {
     }
 
     private void startTimer() {
+        System.out.println("Iniciando timer");
         stopTimer(); // Asegurar que no hay timers activos
         timer = new Timer();
         timerTask = new TimerTask() {
             @Override
             public void run() {
                 try {
-                    if(new Date().getTime() > serviceStarterAt + 1800000 ){
+                    // Verificar si ha pasado mucho tiempo sin envío de ubicaciones
+                    long timeSinceLastSending = new Date().getTime() - lastSendingAt;
+                    if (timeSinceLastSending > 600000) { // 10 minutos sin envío
+                        bitacoraManager.guardarEvento("Sin ubicaciones por 10 minutos", 1006, "Verificando GPS");
+                        // Forzar reinicio del GPS
+                        Intent restartIntent = new Intent(context, BackgroundLocationService.class);
+                        restartIntent.setAction("ACTION.RESTARTFOREGROUND_ACTION");
+                        context.startService(restartIntent);
+                        return;
+                    }
+                    
+                    // Verificar si el servicio lleva más de 30 minutos activo
+                    if(new Date().getTime() > serviceStarterAt + 1800000){ // 30 minutos
+                        System.out.println("reiniciando servicio por tiempo");
                         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
                             restearVariables();
                         } else {
@@ -711,7 +1072,7 @@ public class BackgroundLocationService extends Service {
                             context.startService(ser);
                         }
                     }
-                    Location locthis = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    @SuppressLint("MissingPermission") Location locthis = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
                     if(locthis != null){
                         locthis.setTime(new Date().getTime());
                         listenerLocation.onLocationChanged(locthis);
@@ -727,7 +1088,8 @@ public class BackgroundLocationService extends Service {
                 }
             }
         };
-        timer.schedule(timerTask, 1800000);
+        // Ejecutar cada 5 minutos en lugar de una sola vez
+        timer.scheduleAtFixedRate(timerTask, 300000, 300000);
     }
 
     private void stopTimer() {

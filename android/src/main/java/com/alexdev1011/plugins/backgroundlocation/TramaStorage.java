@@ -223,9 +223,6 @@ public class TramaStorage {
                                 detalleError.toString()
                         );
                     }
-
-
-
                     guardarTramas();
                     // Toast.makeText( context, "tramas rechazadas" ,Toast.LENGTH_LONG).show();
                 }
@@ -335,7 +332,6 @@ public class TramaStorage {
     @SuppressLint("SuspiciousIndentation")
     public void agregarTrama(JSONObject contenido ){
         try {
-            guardarTramas();
             System.out.println(" publicando ?" + publicando.get());
             System.out.println("259 contenido =>");
             System.out.println(contenido);
@@ -356,6 +352,7 @@ public class TramaStorage {
                     content.put("intents", 0);
                     content.put("tramas", tramasNuevas);
                     usersTramas.put(content);
+                    guardarTramas();
                     // System.out.println("cantidad de lotes => " + usersTramas.getJSONObject(0).getJSONArray("tramas").length());
                     // System.out.println("cantidad de tramas en el primer lote => " + usersTramas.getJSONObject(0).getJSONArray("tramas").getJSONArray(0).length());
                     if (networkStatus.getConnectivityStatus(context) > 0 && sePuedePublicar()) {
@@ -367,6 +364,7 @@ public class TramaStorage {
                     }
                 } catch (JSONException e) {
                     e.printStackTrace();
+                    guardarTramas();
                 }
             } else {
                 JSONObject nuevoObjeto = null;
@@ -415,7 +413,8 @@ public class TramaStorage {
                     inmprimirDetalle();
 
                     System.out.println("320 Es un usuario nuevo ? " + esNuevo);
-
+                    guardarTramas();
+                    
                     // Ahora hacemos las modificaciones al JSONArray
                     if (!esNuevo && nuevoObjeto != null) {
                         usersTramas.put(indiceUsuario, nuevoObjeto);

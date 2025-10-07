@@ -9,7 +9,6 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
-
 public class LocationServiceMonitorWorker extends Worker {
 
     public LocationServiceMonitorWorker(@NonNull Context context, @NonNull WorkerParameters params) {
@@ -20,13 +19,16 @@ public class LocationServiceMonitorWorker extends Worker {
     @Override
     public Result doWork() {
         Context context = getApplicationContext();
+        BitacoraManager bitacoraManager = new BitacoraManager(context);
         Log.i("WORKER", "Background service started");
         LocalStorage localStorage = new LocalStorage(context);
         ServiceSettings settingData = (ServiceSettings) localStorage.getObject("settingData");
+
         if (!isServiceRunning(context, BackgroundLocationService.class) && settingData != null && settingData.inBG && settingData.appStarted ) {
+            Log.i("WORKER", "Reiniciando servicio");
             Intent serviceIntent = new Intent(context, BackgroundLocationService.class);
             serviceIntent.setAction("ACTION.STARTFOREGROUND_ACTION");
-
+            bitacoraManager.limpiarBitacora();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent);
             } else {

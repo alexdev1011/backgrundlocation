@@ -5,7 +5,7 @@
 
     <application   android:usesCleartextTraffic="true" >
         <service android:enabled="true"
-            android:exported="true"
+            android:exported="false"
             android:singleUser="true"
             android:foregroundServiceType="location" android:name="com.alexdev1011.plugins.backgroundlocation.BackgroundLocationService"
             tools:ignore="ForegroundServicePermission" />
@@ -43,5 +43,10 @@
     <uses-permission android:name="REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" 
+        tools:ignore="ScopedStorage" />
     <uses-feature android:name="android.hardware.location.gps"/>
 </manifest>
