@@ -87,6 +87,9 @@ public class BackgroundLocationService extends Service {
     // Timer para tareas programadas
     private Timer timer;
     private TimerTask timerTask;
+    // Timer para verificar envío de tramas sin posición
+    private Timer timerSinPosicion;
+    private TimerTask timerTaskSinPosicion;
     // Bandera para reiniciar el servicio
     private Boolean RESTARTSERVICE = false;
     // Gestor para registrar eventos y logs
@@ -671,6 +674,7 @@ public class BackgroundLocationService extends Service {
         if(listenerNetwork != null)
             locationManager.removeUpdates(listenerNetwork);
         stopTimer();
+        stopTimerSinPosicion();
         //Toast.makeText(this, "Traker Detenido", Toast.LENGTH_LONG).show();
         bitacoraManager.guardarEvento("Servicio destruido",10,"Tracker detenido");
         Log.d("My Service", "onDestroy");
@@ -780,6 +784,9 @@ public class BackgroundLocationService extends Service {
         // Resetear variables de detección de GPS atascado
         repeatedLocationCount = 0;
         lastReceivedLocation = null;
+        // Detener timers existentes
+        stopTimer();
+        stopTimerSinPosicion();
         try {
             Http cc =  Http.getInstance(this);
             cc.cancelAllRequests();
@@ -865,6 +872,7 @@ public class BackgroundLocationService extends Service {
             Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
             listenerLocation.onLocationChanged(loc);
             startTimer();
+            startTimerSinPosicion();
            /**
             *  if(this.settings.inBG)
             *      onActivityStopped();
@@ -1101,6 +1109,137 @@ public class BackgroundLocationService extends Service {
             timer.cancel();
             timer.purge();
             timer = null;
+        }
+    }
+
+    /**
+     * Crea una trama con la última posición conocida o sin posición si no está disponible
+     * @return JSObject con datos de ubicación (última conocida o sin coordenadas)
+     */
+    private JSObject crearTramaConUltimaPosicion() {
+        JSObject location = new JSObject();
+        
+        // Incluir estado de pánico y resetear banderas
+        location.put("panic", settings.panico);
+        settings.panico = false;
+        settings.stopService = false;
+        
+        try {
+            // Guardar configuraciones actualizadas
+            localStorage.setObject("settingData", settings);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        
+        // Obtener nivel de batería
+        float batteryPct = obtenerNivelBateria();
+        
+        // Intentar obtener la última ubicación conocida
+        Location ultimaUbicacion = null;
+        try {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                ultimaUbicacion = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            }
+        } catch (Exception e) {
+            bitacoraManager.guardarEvento("Error al obtener última ubicación", 503, e.getMessage());
+        }
+        
+        // Crear motivo para la trama
+        JSObject motivoTrama = new JSObject();
+        
+        if (ultimaUbicacion != null) {
+            // Usar la última ubicación conocida
+            motivoTrama.put("code", 2002);
+            motivoTrama.put("message", "trama con última posición conocida");
+            
+            // Agregar datos de la última ubicación conocida
+            location.put("reason", motivoTrama);
+            location.put("accuracy", Math.round(ultimaUbicacion.getAccuracy()));
+            location.put("altitude", Math.round(ultimaUbicacion.getAltitude()));
+            location.put("bearing", Math.round(ultimaUbicacion.getBearing()));
+            location.put("provider", ultimaUbicacion.getProvider());
+            location.put("speed", Math.round((ultimaUbicacion.getSpeed() * 3.6)));
+            location.put("time", ultimaUbicacion.getTime());
+            location.put("battery", batteryPct);
+            location.put("latitude", ultimaUbicacion.getLatitude());
+            location.put("longitude", ultimaUbicacion.getLongitude());
+        } else {
+            // No hay última ubicación conocida, crear trama sin posición
+            motivoTrama.put("code", 2001);
+            motivoTrama.put("message", "trama sin posición - sin ubicación disponible");
+            
+            // Agregar datos básicos sin coordenadas
+            location.put("reason", motivoTrama);
+            location.put("accuracy", -1);  // -1 indica sin precisión
+            location.put("altitude", 0);
+            location.put("bearing", 0);
+            location.put("provider", "sin_posicion");
+            location.put("speed", 0);
+            location.put("time", new Date().getTime());
+            location.put("battery", batteryPct);
+            location.put("latitude", 0.0);  // Coordenadas en 0
+            location.put("longitude", 0.0);
+        }
+        
+        return location;
+    }
+
+    /**
+     * Obtiene el nivel actual de batería del dispositivo
+     * @return Porcentaje de batería (0-100)
+     */
+    private float obtenerNivelBateria() {
+        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batteryStatus = context.registerReceiver(null, ifilter);
+        int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        return level * 100 / (float) scale;
+    }
+
+    /**
+     * Inicia el timer que verifica cada minuto si se debe enviar una trama sin posición
+     */
+    private void startTimerSinPosicion() {
+        System.out.println("Iniciando timer sin posición");
+        stopTimerSinPosicion(); // Asegurar que no hay timers activos
+        timerSinPosicion = new Timer();
+        timerTaskSinPosicion = new TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    // Verificar si ha pasado más de 2 minutos sin envío de ubicación
+                    long timeSinceLastSending = new Date().getTime() - lastSendingAt;
+                    if (timeSinceLastSending > 120000) { // 2 minutos sin envío
+                        bitacoraManager.guardarEvento("Enviando trama con última posición conocida", 2002, "Sin ubicación por " + (timeSinceLastSending/1000) + " segundos");
+                        
+                        // Crear trama con última posición conocida o sin posición
+                        JSObject locationConUltimaPosicion = crearTramaConUltimaPosicion();
+                        JSObject senData = listenerGPS.crearDatosEnvio(locationConUltimaPosicion);
+                        
+                        // Enviar trama con última posición o sin posición
+                        listenerGPS.enviarTrama(senData);
+                    }
+                } catch (Exception e) {
+                    bitacoraManager.guardarEvento("Error en timer sin posición", 502, e.getMessage());
+                }
+            }
+        };
+        // Ejecutar cada 1 minuto
+        timerSinPosicion.scheduleAtFixedRate(timerTaskSinPosicion, 60000, 60000);
+    }
+
+    /**
+     * Detiene el timer de tramas sin posición
+     */
+    private void stopTimerSinPosicion() {
+        if (timerTaskSinPosicion != null) {
+            timerTaskSinPosicion.cancel();
+            timerTaskSinPosicion = null;
+        }
+        if (timerSinPosicion != null) {
+            timerSinPosicion.cancel();
+            timerSinPosicion.purge();
+            timerSinPosicion = null;
         }
     }
 

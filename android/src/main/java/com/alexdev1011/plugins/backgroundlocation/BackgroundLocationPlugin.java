@@ -276,6 +276,7 @@ public class BackgroundLocationPlugin extends Plugin {
             this.verificarPermisos();
         }
     }
+
     void resolverperisoimei(Boolean isGranted)  {
         if (isGranted) {
             // Permission is granted. Continue the action or workflow in your app.
@@ -348,17 +349,65 @@ public class BackgroundLocationPlugin extends Plugin {
 
     @PluginMethod(returnType=PluginMethod.RETURN_CALLBACK)
     public void getBitacora(PluginCall call) throws JSONException {
-        // Eliminado el uso de logcat que causa problemas de SELinux
-        // Usar solo la bitácora interna del sistema
         JSObject data = new JSObject();
+        JSONArray consoleLog = new JSONArray();
+        boolean logcatAvailable = false;
+        
         try {
+            // Intentar obtener logcat de forma segura
+            Process process = Runtime.getRuntime().exec("logcat ActivityManager:io.ionic.starter:D *:I  -d");
+            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            
+            String line = "";
+            int lineCount = 0;
+            while ((line = bufferedReader.readLine()) != null && lineCount < 1000) {
+                consoleLog.put(line);
+                lineCount++;
+            }
+            bufferedReader.close();
+            process.destroy();
+            logcatAvailable = true;
+            
+        } catch (SecurityException e) {
+            // SELinux o permisos bloquean el acceso
+            consoleLog.put("❌ Logcat no disponible: Bloqueado por SELinux o permisos del sistema");
+            consoleLog.put("ℹ️  Dispositivo con restricciones de seguridad activas");
+            logcatAvailable = false;
+        } catch (IOException e) {
+            // Error de I/O o comando no disponible
+            consoleLog.put("❌ Logcat no disponible: Error de acceso al sistema");
+            consoleLog.put("ℹ️  Comando logcat no ejecutable en este dispositivo");
+            logcatAvailable = false;
+        } catch (Exception e) {
+            // Cualquier otro error
+            consoleLog.put("❌ Logcat no disponible: " + e.getMessage());
+            consoleLog.put("ℹ️  Error inesperado al acceder a logs del sistema");
+            logcatAvailable = false;
+        }
+        
+        try {
+            // Siempre obtener la bitácora interna
             JSONArray bitacora = bitacoraManager.obtenerBitacora();
-            data.put("bitacora",  bitacora);
-            data.put("console", new JSONArray()); // Array vacío en lugar de logcat
+            data.put("bitacora", bitacora);
+            data.put("console", consoleLog);
+            data.put("logcatAvailable", logcatAvailable);
+            
+            // Agregar información sobre el estado del logcat
+            if (!logcatAvailable) {
+                data.put("logcatStatus", "disabled");
+                data.put("logcatMessage", "Logcat no disponible en este dispositivo");
+            } else {
+                data.put("logcatStatus", "enabled");
+                data.put("logcatMessage", "Logcat funcionando correctamente");
+            }
+            
             call.resolve(data);
-        } catch (Exception e ){
-            data.put("bitacora",  new JSONArray());
-            data.put("console", new JSONArray());
+        } catch (Exception e) {
+            data.put("bitacora", new JSONArray());
+            data.put("console", consoleLog);
+            data.put("logcatAvailable", logcatAvailable);
+            data.put("logcatStatus", "error");
+            data.put("logcatMessage", "Error al obtener bitácora interna: " + e.getMessage());
             call.resolve(data);
         }
     }
@@ -366,6 +415,51 @@ public class BackgroundLocationPlugin extends Plugin {
     @PluginMethod(returnType=PluginMethod.RETURN_CALLBACK)
     public void clearTramas(PluginCall call) throws JSONException {
         bitacoraManager.limpiarBitacora();
+    }
+
+    @PluginMethod(returnType=PluginMethod.RETURN_CALLBACK)
+    public void checkLogcatAvailability(PluginCall call) throws JSONException {
+        JSObject data = new JSObject();
+        boolean isAvailable = false;
+        String message = "";
+        
+        try {
+            // Prueba simple para verificar si logcat está disponible
+            Process process = Runtime.getRuntime().exec("logcat -d -t 1");
+            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            
+            String line = bufferedReader.readLine();
+            if (line != null && !line.isEmpty()) {
+                isAvailable = true;
+                message = "Logcat disponible y funcionando";
+            } else {
+                isAvailable = false;
+                message = "Logcat no devuelve datos";
+            }
+            
+            bufferedReader.close();
+            process.destroy();
+            
+        } catch (SecurityException e) {
+            isAvailable = false;
+            message = "Logcat bloqueado por SELinux o permisos del sistema";
+        } catch (IOException e) {
+            isAvailable = false;
+            message = "Error de acceso al sistema: " + e.getMessage();
+        } catch (Exception e) {
+            isAvailable = false;
+            message = "Error inesperado: " + e.getMessage();
+        }
+        
+        data.put("available", isAvailable);
+        data.put("message", message);
+        data.put("deviceInfo", getDeviceInfo());
+        
+        call.resolve(data);
+    }
+    
+    private String getDeviceInfo() {
+        return "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")";
     }
 
     @PluginMethod
@@ -386,7 +480,6 @@ public class BackgroundLocationPlugin extends Plugin {
         this.startServiceCall = call;
         verificarPermisos( );
     }
-
 
     @RequiresApi(api = Build.VERSION_CODES.O)
 
