@@ -82,16 +82,78 @@ public class TramaStorage {
             this.settings = settingData;
         }
         System.out.println("Iniciando tramas storage");
-        String tramasCrud = localStorage.getItem("tramas");
-        if(tramasCrud != null ){
-            usersTramas = new JSONArray(tramasCrud);
-            if(usersTramas != null ){
-                if(usersTramas.length() > 0 ){
-                    System.out.println("90 cantidad de lotes => " + usersTramas.getJSONObject(0).getJSONArray("tramas").length());
+        
+        // SOLUCIÓN: Validación robusta de datos JSON con recuperación automática
+        usersTramas = initializeTramasWithValidation();
+    }
+    
+    /**
+     * Inicializa el array de tramas con validación robusta y recuperación automática
+     * @return JSONArray válido o vacío en caso de corrupción
+     */
+    private JSONArray initializeTramasWithValidation() {
+        try {
+            String tramasCrud = localStorage.getItem("tramas");
+            
+            // Validar que el string no sea null, vacío o contenga solo caracteres corruptos
+            if (tramasCrud == null || tramasCrud.trim().isEmpty()) {
+                System.out.println("No hay datos de tramas almacenados, inicializando array vacío");
+                return new JSONArray();
+            }
+            
+            // Validar que no contenga caracteres corruptos (como los que aparecen en el log)
+            if (tramasCrud.contains("") || tramasCrud.contains("\u0000")) {
+                System.out.println("Datos corruptos detectados, limpiando almacenamiento");
+                bitacoraManager.guardarEvento("Datos corruptos detectados", 1001, "Limpiando almacenamiento de tramas");
+                localStorage.removeItem("tramas");
+                return new JSONArray();
+            }
+            
+            // Intentar crear JSONArray con validación adicional
+            JSONArray tramas = new JSONArray(tramasCrud);
+            
+            // Validar estructura del JSONArray
+            if (tramas != null && tramas.length() > 0) {
+                // Verificar que el primer elemento tenga la estructura esperada
+                try {
+                    JSONObject firstElement = tramas.getJSONObject(0);
+                    if (firstElement.has("userID") && firstElement.has("urlRequest") && firstElement.has("tramas")) {
+                        System.out.println("Datos de tramas válidos cargados, cantidad de lotes => " + 
+                            firstElement.getJSONArray("tramas").length());
+                        return tramas;
+                    } else {
+                        System.out.println("Estructura de datos inválida, reinicializando");
+                        bitacoraManager.guardarEvento("Estructura inválida", 1002, "Reinicializando tramas");
+                        localStorage.removeItem("tramas");
+                        return new JSONArray();
+                    }
+                } catch (JSONException e) {
+                    System.out.println("Error al validar estructura de tramas: " + e.getMessage());
+                    bitacoraManager.guardarEvento("Error validación estructura", 1003, e.getMessage());
+                    localStorage.removeItem("tramas");
+                    return new JSONArray();
                 }
             }
-        } else{
-            usersTramas = new JSONArray();
+            
+            return tramas;
+            
+        } catch (JSONException e) {
+            System.out.println("Error al parsear JSON de tramas: " + e.getMessage());
+            bitacoraManager.guardarEvento("Error parseo JSON", 1004, e.getMessage());
+            
+            // Limpiar datos corruptos y reinicializar
+            try {
+                localStorage.removeItem("tramas");
+                System.out.println("Datos corruptos eliminados, reinicializando con array vacío");
+            } catch (Exception cleanupError) {
+                System.out.println("Error al limpiar datos corruptos: " + cleanupError.getMessage());
+            }
+            
+            return new JSONArray();
+        } catch (Exception e) {
+            System.out.println("Error inesperado al inicializar tramas: " + e.getMessage());
+            bitacoraManager.guardarEvento("Error inesperado", 1005, e.getMessage());
+            return new JSONArray();
         }
     }
 

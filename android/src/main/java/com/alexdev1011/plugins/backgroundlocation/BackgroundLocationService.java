@@ -20,8 +20,17 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
+
+import androidx.annotation.NonNull;
+import androidx.core.app.ActivityCompat;
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationServices;
+
+import com.google.android.gms.tasks.OnSuccessListener;
 
 import androidx.annotation.RequiresApi;
 import androidx.core.app.ActivityCompat;
@@ -60,9 +69,9 @@ public class BackgroundLocationService extends Service {
     private JSObject motivo = new JSObject();
     // ID único para la notificación del servicio
     private static final int NOTIFICATION_ID = 45023;
-    // Gestor de ubicación del sistema Android
-    public LocationManager locationManager;
-    // Listeners para diferentes proveedores de ubicación
+    // Cliente de ubicación fusionada de Google Play Services
+    public FusedLocationProviderClient fusedLocationClient;
+    // Listeners para diferentes proveedores de ubicación (mantenidos para compatibilidad)
     public MyLocationListener listenerNetwork;
     public MyLocationListener listenerGPS;
     public MyLocationListener listenerLocation;
@@ -367,11 +376,8 @@ public class BackgroundLocationService extends Service {
     private void restartLocationServices() {
         try {
             // Detener listeners actuales
-            if (listenerGPS != null) {
-                locationManager.removeUpdates(listenerGPS);
-            }
-            if (listenerNetwork != null) {
-                locationManager.removeUpdates(listenerNetwork);
+            if (fusedLocationClient != null) {
+                fusedLocationClient.removeLocationUpdates(locationCallback);
             }
             
             // Limpiar variables
@@ -383,9 +389,9 @@ public class BackgroundLocationService extends Service {
             // Esperar un momento antes de reagregar
             Thread.sleep(2000);
             
-            // Reagregar listeners
+            // Reagregar listeners con FusedLocationProviderClient
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listenerGPS);
+                startLocationUpdates();
             }
             
             bitacoraManager.guardarEvento("Servicios de ubicación reiniciados", 1005, "GPS desatascado");
@@ -395,10 +401,48 @@ public class BackgroundLocationService extends Service {
         }
     }
 
+    /**
+     * Inicia las actualizaciones de ubicación usando FusedLocationProviderClient
+     */
+    private void startLocationUpdates() {
+        if (fusedLocationClient == null) {
+            fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+        }
+        
+        LocationRequest locationRequest = LocationRequest.create()
+                .setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY)
+                .setInterval(250) // 250ms
+                .setFastestInterval(100) // 100ms
+                .setSmallestDisplacement(0); // 0 metros
+        
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            fusedLocationClient.requestLocationUpdates(
+                locationRequest,
+                locationCallback,
+                Looper.getMainLooper()
+            );
+        }
+    }
+
     // Acción de broadcast para comunicación entre componentes
     static final String ACTION_BROADCAST = (
             BackgroundLocationService.class.getPackage().getName() + ".broadcast"
     );
+
+    // Callback para recibir actualizaciones de ubicación con FusedLocationProviderClient
+    private LocationCallback locationCallback = new LocationCallback() {
+        @Override
+        public void onLocationResult(LocationResult locationResult) {
+            if (locationResult == null) {
+                return;
+            }
+            for (Location location : locationResult.getLocations()) {
+                if (listenerLocation != null) {
+                    listenerLocation.onLocationChanged(location);
+                }
+            }
+        }
+    };
 
     /**
      * Listener personalizado para recibir actualizaciones de ubicación
@@ -605,20 +649,48 @@ public class BackgroundLocationService extends Service {
             System.out.println("se envia la trama");
             lastSendingAt = new Date().getTime();
             
+            // SOLUCIÓN: Validación null y recuperación automática de tramaStorage
+            if (tramaStorage == null) {
+                System.out.println("tramaStorage es null, intentando reinicializar");
+                bitacoraManager.guardarEvento("tramaStorage null detectado", 1006, "Reinicializando TramaStorage");
+                
+                try {
+                    tramaStorage = new TramaStorage(context);
+                    System.out.println("TramaStorage reinicializado exitosamente");
+                } catch (JSONException e) {
+                    System.out.println("Error al reinicializar TramaStorage: " + e.getMessage());
+                    bitacoraManager.guardarEvento("Error reinicialización TramaStorage", 1007, e.getMessage());
+                    return; // Salir sin enviar la trama
+                }
+            }
+            
             // Solo enviar si hay URL configurada
             if (!settings.urlRequests.equals("")) {
                 try {
                     System.out.println("256 agregando trama");
                     tramaStorage.agregarTrama(senData);
                 } catch (Error err) {
-                    System.out.println(err);
-                    System.out.println("un error");
+                    System.out.println("Error al agregar trama: " + err.getMessage());
+                    bitacoraManager.guardarEvento("Error agregar trama", 1008, err.getMessage());
+                    
+                    // Intentar reinicializar TramaStorage antes de reiniciar el servicio
+                    try {
+                        System.out.println("Intentando reinicializar TramaStorage");
+                        tramaStorage = new TramaStorage(context);
+                        System.out.println("TramaStorage reinicializado, reintentando envío");
+                        tramaStorage.agregarTrama(senData);
+                        return; // Éxito, no reiniciar servicio
+                    } catch (JSONException e) {
+                        System.out.println("Error al reinicializar TramaStorage: " + e.getMessage());
+                        bitacoraManager.guardarEvento("Error reinicialización TramaStorage", 1009, e.getMessage());
+                    }
+                    
+                    // Solo reiniciar servicio si la reinicialización falla
+                    System.out.println("Reiniciando servicio debido a error persistente");
                     // Manejar error según la versión de Android
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        if(listenerGPS != null)
-                            locationManager.removeUpdates(listenerGPS);
-                        if(listenerNetwork != null)
-                            locationManager.removeUpdates(listenerNetwork);
+                        if(fusedLocationClient != null)
+                            fusedLocationClient.removeLocationUpdates(locationCallback);
 
                         restearVariables();
 
@@ -669,10 +741,9 @@ public class BackgroundLocationService extends Service {
 
     public void onDestroy() {
         System.out.println("terminando el servicio");
-        if(listenerGPS != null)
-            locationManager.removeUpdates(listenerGPS);
-        if(listenerNetwork != null)
-            locationManager.removeUpdates(listenerNetwork);
+        // Detener actualizaciones de FusedLocationProviderClient
+        if(fusedLocationClient != null)
+            fusedLocationClient.removeLocationUpdates(locationCallback);
         stopTimer();
         stopTimerSinPosicion();
         //Toast.makeText(this, "Traker Detenido", Toast.LENGTH_LONG).show();
@@ -847,7 +918,8 @@ public class BackgroundLocationService extends Service {
                 this.settings = settingData;
             }
             this.startId = startId;
-            locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            // Inicializar FusedLocationProviderClient
+            fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
             listenerGPS = new MyLocationListener();
             listenerLocation = new MyLocationListener();
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
@@ -855,22 +927,22 @@ public class BackgroundLocationService extends Service {
             }
             bufferTramas.clear();
             serviceStarterAt = new Date().getTime();
-            LocationCallback locationCallback = new LocationCallback() {
-                @Override
-                public void onLocationResult(LocationResult locationResult) {
-                    if (locationResult == null) {
-                        return;
+            
+            // Iniciar actualizaciones de ubicación con FusedLocationProviderClient
+            startLocationUpdates();
+            
+            // Obtener última ubicación conocida
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                fusedLocationClient.getLastLocation().addOnSuccessListener(new OnSuccessListener<Location>() {
+                    @Override
+                    public void onSuccess(Location location) {
+                        if (location != null && listenerLocation != null) {
+                            listenerLocation.onLocationChanged(location);
+                        }
                     }
-                    for (Location location : locationResult.getLocations()) {
-                        listenerLocation.onLocationChanged(location);
-                        // Update UI with location data
-                        // ...
-                    }
-                }
-            };
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listenerGPS);
-            Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            listenerLocation.onLocationChanged(loc);
+                });
+            }
+            
             startTimer();
             startTimerSinPosicion();
            /**
@@ -887,10 +959,8 @@ public class BackgroundLocationService extends Service {
                 System.out.println("el servicio se detuvo gracias al action");
                 //your end servce code
                 if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
-                    if(listenerGPS != null)
-                        locationManager.removeUpdates(listenerGPS);
-                    if(listenerNetwork != null)
-                        locationManager.removeUpdates(listenerNetwork);
+                    if(fusedLocationClient != null)
+                        fusedLocationClient.removeLocationUpdates(locationCallback);
                     
                     restearVariables();
                     // Detener este servicio
@@ -919,10 +989,30 @@ public class BackgroundLocationService extends Service {
     public void onCreate()  {
         context = this;
 
+        // SOLUCIÓN: Inicialización robusta de TramaStorage con manejo de errores
         try {
             this.tramaStorage = new TramaStorage(this);
+            System.out.println("TramaStorage inicializado exitosamente");
         } catch (JSONException e) {
-            e.printStackTrace();
+            System.out.println("Error al inicializar TramaStorage: " + e.getMessage());
+            bitacoraManager.guardarEvento("Error inicialización TramaStorage", 1010, e.getMessage());
+            
+            // Intentar reinicialización después de limpiar datos corruptos
+            try {
+                // Limpiar datos corruptos
+                localStorage.removeItem("tramas");
+                System.out.println("Datos corruptos eliminados, reintentando inicialización");
+                
+                // Reintentar inicialización
+                this.tramaStorage = new TramaStorage(this);
+                System.out.println("TramaStorage reinicializado exitosamente");
+                bitacoraManager.guardarEvento("TramaStorage recuperado", 1011, "Reinicialización exitosa");
+            } catch (JSONException retryException) {
+                System.out.println("Error persistente al inicializar TramaStorage: " + retryException.getMessage());
+                bitacoraManager.guardarEvento("Error persistente TramaStorage", 1012, retryException.getMessage());
+                // Continuar sin TramaStorage - se intentará reinicializar más tarde
+                this.tramaStorage = null;
+            }
         }
 
         ServiceSettings settingData = (ServiceSettings) this.localStorage.getObject("settingData");
@@ -1080,16 +1170,28 @@ public class BackgroundLocationService extends Service {
                             context.startService(ser);
                         }
                     }
-                    @SuppressLint("MissingPermission") Location locthis = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                    if(locthis != null){
-                        locthis.setTime(new Date().getTime());
-                        listenerLocation.onLocationChanged(locthis);
-                    } else {
-                        locthis = isBetterLocationinArray(true);
-                        if(locthis != null) {
-                            locthis.setTime(new Date().getTime());
-                            listenerLocation.onLocationChanged(locthis);
-                        }
+                    // Obtener última ubicación conocida usando FusedLocationProviderClient
+                    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                        fusedLocationClient.getLastLocation().addOnSuccessListener(new OnSuccessListener<Location>() {
+                            @Override
+                            public void onSuccess(Location location) {
+                                if (location != null) {
+                                    location.setTime(new Date().getTime());
+                                    if (listenerLocation != null) {
+                                        listenerLocation.onLocationChanged(location);
+                                    }
+                                } else {
+                                    // Si no hay última ubicación, usar la mejor del buffer
+                                    Location locthis = isBetterLocationinArray(true);
+                                    if (locthis != null) {
+                                        locthis.setTime(new Date().getTime());
+                                        if (listenerLocation != null) {
+                                            listenerLocation.onLocationChanged(locthis);
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     }
                 } catch (Exception e) {
                     bitacoraManager.guardarEvento("Error en timer", 501, e.getMessage());
@@ -1134,11 +1236,17 @@ public class BackgroundLocationService extends Service {
         // Obtener nivel de batería
         float batteryPct = obtenerNivelBateria();
         
-        // Intentar obtener la última ubicación conocida
+        // Intentar obtener la última ubicación conocida usando FusedLocationProviderClient
         Location ultimaUbicacion = null;
         try {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                ultimaUbicacion = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                // FusedLocationProviderClient ya maneja automáticamente múltiples proveedores
+                // y devuelve la mejor ubicación disponible
+                if (fusedLocationClient != null) {
+                    // Nota: getLastLocation() es asíncrono, pero para este caso necesitamos síncrono
+                    // Por ahora mantenemos la lógica anterior como fallback
+                    ultimaUbicacion = isBetterLocationinArray(true);
+                }
             }
         } catch (Exception e) {
             bitacoraManager.guardarEvento("Error al obtener última ubicación", 503, e.getMessage());
@@ -1225,7 +1333,7 @@ public class BackgroundLocationService extends Service {
             }
         };
         // Ejecutar cada 1 minuto
-        timerSinPosicion.scheduleAtFixedRate(timerTaskSinPosicion, 60000, 60000);
+        timerSinPosicion.schedule(timerTaskSinPosicion, 60000, 60000);
     }
 
     /**
